@@ -1729,7 +1729,7 @@ def _resolve_source_path(filename):
 CSP_PRE_ROLL_SEC = 2  # start playback this many seconds before the CSP marker
 
 
-def _send_fresh(pipe_name, cmd_str, timeout=2.0):
+def _send_fresh(pipe_name, cmd_str, timeout=5.0, retries=1):
     """Send a single command to an MPV IPC pipe via a fresh, short-lived
     handle. Bypasses MpvIpcClient entirely so its persistent reader thread
     can't interfere with the write.
@@ -1737,47 +1737,69 @@ def _send_fresh(pipe_name, cmd_str, timeout=2.0):
     Runs the CreateFile/WriteFile/CloseHandle sequence on an inner daemon
     thread and joins with a timeout. If the inner thread blocks (broken
     pipe, MPV frozen, buffer full, whatever), the caller gets "timeout"
-    and moves on — the stuck inner thread stays alive as a daemon but
-    does not block anything we care about.
+    and can retry up to `retries` times with fresh handles.
 
-    Returns: 'ok' | 'timeout' | 'error: <msg>'
+    Default timeout bumped from 2.0 -> 5.0 because 2.0 was occasionally
+    dropping CSP swap commands on one cell when MPV was briefly slow to
+    accept the connection, leaving that cell's cell_history without its
+    CSP entry and making the GRWM replay show only one cell swapping.
+
+    Returns: 'ok' | 'timeout' | 'error: <msg>' | 'retry-ok'
     """
     if not cmd_str.endswith("\n"):
         cmd_str += "\n"
     data = cmd_str.encode("utf-8")
-    result = {"status": None}
 
-    def _do():
-        handle = None
-        try:
-            handle = win32file.CreateFile(
-                pipe_name,
-                win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None,
-            )
-            win32file.WriteFile(handle, data)
-            result["status"] = "ok"
-        except pywintypes.error as e:
-            result["status"] = f"error: {e}"
-        except Exception as e:
-            result["status"] = f"error: {e}"
-        finally:
-            if handle is not None:
-                try:
-                    win32file.CloseHandle(handle)
-                except Exception:
-                    pass
+    def _do_one_attempt():
+        result = {"status": None}
+        def _inner():
+            handle = None
+            try:
+                handle = win32file.CreateFile(
+                    pipe_name,
+                    win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                win32file.WriteFile(handle, data)
+                result["status"] = "ok"
+            except pywintypes.error as e:
+                result["status"] = f"error: {e}"
+            except Exception as e:
+                result["status"] = f"error: {e}"
+            finally:
+                if handle is not None:
+                    try:
+                        win32file.CloseHandle(handle)
+                    except Exception:
+                        pass
+        t = threading.Thread(target=_inner, daemon=True, name="PipeSend")
+        t_start = time.monotonic()
+        t.start()
+        t.join(timeout)
+        elapsed = time.monotonic() - t_start
+        if t.is_alive():
+            return "timeout", elapsed
+        return (result["status"] or "error: unknown"), elapsed
 
-    t = threading.Thread(target=_do, daemon=True, name="PipeSend")
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return "timeout"
-    return result["status"] or "error: unknown"
+    status, elapsed = _do_one_attempt()
+    if status == "ok":
+        return status
+    if status.startswith("error:"):
+        # Hard errors (no such pipe, etc) — no point retrying.
+        return status
+    # Retry loop only on timeout.
+    attempt = 1
+    while status == "timeout" and attempt <= retries:
+        print(f"[send] {pipe_name}: timeout after {elapsed:.2f}s, retry {attempt}/{retries}", flush=True)
+        status, elapsed = _do_one_attempt()
+        if status == "ok":
+            return "retry-ok"
+        attempt += 1
+    return status
 
 
 def _pipe_name_for(socket_idx):
@@ -1807,8 +1829,8 @@ def adjust_panscan(delta):
     for i, client in enumerate(sockets):
         if client is None:
             continue
-        status = _send_fresh(_pipe_name_for(i), cmd, timeout=1.5)
-        if status == "ok":
+        status = _send_fresh(_pipe_name_for(i), cmd, timeout=5.0, retries=1)
+        if status in ("ok", "retry-ok"):
             sent += 1
         else:
             failed += 1
@@ -1874,10 +1896,12 @@ def trigger_csp_swap():
         pipe_name = _pipe_name_for(socket_idx)
 
         print(f"  Socket {socket_idx}: sending via {pipe_name}: {cmd}", flush=True)
-        status = _send_fresh(pipe_name, cmd, timeout=2.0)
-        print(f"  Socket {socket_idx}: send status = {status}", flush=True)
+        t0 = time.monotonic()
+        status = _send_fresh(pipe_name, cmd, timeout=5.0, retries=1)
+        elapsed = time.monotonic() - t0
+        print(f"  Socket {socket_idx}: send status = {status} ({elapsed:.2f}s)", flush=True)
 
-        if status == "ok":
+        if status in ("ok", "retry-ok"):
             _update_cell_state(socket_idx, filename, start_sec, meta)
             print(f"  Socket {socket_idx}: OK -> CSP @ {csp_str} (start {start_str}, -{CSP_PRE_ROLL_SEC}s)", flush=True)
             swapped += 1
@@ -1928,28 +1952,101 @@ def generate_grwm_script(session_dir):
     session_end = time.time()
     total_duration = max(1.0, session_end - session_start)
 
+    # ---- Build merged panscan timeline for time-varying replay ----
+    # panscan_events is sorted (wall, value) — the value is active FROM
+    # that wall time onward until the next event. Start with a synthetic
+    # (session_start, 1.0) anchor so scenes before any +/- press get
+    # the default fill behavior.
+    panscan_events = [(session_start, 1.0)]
+    for entry in session_panscan_history:
+        w, v = entry[0], entry[1]
+        if w >= session_start:
+            panscan_events.append((w, v))
+    panscan_events.sort(key=lambda x: x[0])
+
+    def _panscan_at(wall_time):
+        """Return the panscan value active at the given wall time."""
+        active = 1.0
+        for w, v in panscan_events:
+            if w <= wall_time:
+                active = v
+            else:
+                break
+        return active
+
+    def _split_scene_by_panscan(filename, in_sec, wall_start, wall_end):
+        """Split a scene into sub-scenes at panscan change points.
+        Each sub-scene has a constant panscan value.
+        Returns list of {filename, in_sec, duration, panscan}."""
+        scene_duration = wall_end - wall_start
+        if scene_duration <= 0:
+            return []
+        current_panscan = _panscan_at(wall_start)
+        # Changes strictly inside the window (exclusive of boundaries)
+        changes_in_window = [
+            (w, v) for w, v in panscan_events
+            if wall_start < w < wall_end
+        ]
+        if not changes_in_window:
+            return [{
+                "filename": filename,
+                "in_sec": in_sec,
+                "duration": scene_duration,
+                "panscan": current_panscan,
+            }]
+        sub_scenes = []
+        sub_wall = wall_start
+        sub_in = in_sec
+        sub_panscan = current_panscan
+        for change_wall, new_value in changes_in_window:
+            sub_duration = change_wall - sub_wall
+            if sub_duration > 0.01:
+                sub_scenes.append({
+                    "filename": filename,
+                    "in_sec": sub_in,
+                    "duration": sub_duration,
+                    "panscan": sub_panscan,
+                })
+                sub_in += sub_duration
+            sub_wall = change_wall
+            sub_panscan = new_value
+        final_duration = wall_end - sub_wall
+        if final_duration > 0.01:
+            sub_scenes.append({
+                "filename": filename,
+                "in_sec": sub_in,
+                "duration": final_duration,
+                "panscan": sub_panscan,
+            })
+        return sub_scenes
+
     # ---- Group history by cell, compute per-scene durations ----
     by_socket = {}
     for entry in history:
         by_socket.setdefault(entry["socket_idx"], []).append(entry)
 
     cell_scenes = {}
+    total_panscan_splits = 0
     for socket_idx in range(grid_size):
         entries = by_socket.get(socket_idx, [])
         entries.sort(key=lambda e: e["wall"])
         scenes = []
         for i, e in enumerate(entries):
+            wall_start = e["wall"]
             if i + 1 < len(entries):
-                duration = entries[i + 1]["wall"] - e["wall"]
+                wall_end = entries[i + 1]["wall"]
             else:
-                duration = session_end - e["wall"]
-            duration = max(0.5, duration)
-            scenes.append({
-                "filename": e["filename"],
-                "in_sec": e["pos_sec"],
-                "duration": duration,
-            })
+                wall_end = session_end
+            raw_duration = max(0.5, wall_end - wall_start)
+            wall_end = wall_start + raw_duration
+            # Split this scene at any panscan change points inside its window.
+            subs = _split_scene_by_panscan(e["filename"], e["pos_sec"], wall_start, wall_end)
+            if len(subs) > 1:
+                total_panscan_splits += len(subs) - 1
+            scenes.extend(subs)
         cell_scenes[socket_idx] = scenes
+    if total_panscan_splits > 0:
+        print(f"[GRWM] Time-varying panscan: split {total_panscan_splits} extra sub-scenes across {grid_size} cells")
 
     # ---- Output dimensions ----
     # Match the live session resolution (respects portrait/rotated setups).
@@ -1980,33 +2077,35 @@ def generate_grwm_script(session_dir):
         crop_filter = ""
         print("[GRWM] No crop (session_crop_width/height not set or both == 1.0)")
 
-    # ---- Panscan strategy based on final session_panscan value ----
-    # session_panscan starts at 1.0 (matching MPV's --panscan=1 default)
-    # and adjust_panscan() updates it on +/- key presses. We pick between
-    # two filter strategies based on the final value:
-    #   >= 0.5 : fill mode (force_original_aspect_ratio=increase + center
-    #            crop). Matches MPV's fill-and-crop panscan>0.5 behavior.
-    #   <  0.5 : letterbox mode (force_original_aspect_ratio=decrease +
-    #            pad). Matches MPV's letterbox panscan<0.5 behavior.
-    # Log a warning if panscan was changed mid-session — GRWM only honors
-    # the FINAL value (see TODO on session_panscan near module globals).
+    # ---- Panscan strategy summary ----
+    # Per-scene fill_mode (increase=fill / decrease=letterbox) is now
+    # selected based on that scene's panscan value, derived from the
+    # panscan_events timeline computed above. Scenes that span a panscan
+    # change are already split into sub-scenes with constant panscan.
+    # For the summary log, report the final/latest panscan value.
     panscan_final = max(0.0, min(1.0, float(session_panscan)))
-    if session_panscan_history and len(session_panscan_history) > 0:
-        unique_vals = set(round(v, 2) for _, v in session_panscan_history)
-        if len(unique_vals) > 1:
-            print(f"[GRWM] WARN: panscan changed during session "
-                  f"({sorted(unique_vals)}). GRWM uses final value "
-                  f"{panscan_final:.2f} for the whole replay. True "
-                  f"time-varying panscan reconstruction is a future "
-                  f"improvement (see TODO).")
-    if panscan_final >= 0.5:
-        fill_mode = "increase"
-        fill_suffix = f"crop={cell_w}:{cell_h}:(iw-{cell_w})/2:(ih-{cell_h})/2"
-        print(f"[GRWM] Panscan final={panscan_final:.2f} -> fill mode (scale+crop)")
-    else:
-        fill_mode = "decrease"
-        fill_suffix = f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
-        print(f"[GRWM] Panscan final={panscan_final:.2f} -> letterbox mode (scale+pad)")
+    print(f"[GRWM] Panscan final={panscan_final:.2f}, timeline events={len(panscan_events)}")
+
+    def _fill_for(panscan_value):
+        """Return (fill_mode, fill_suffix) for a given panscan value.
+        Matches MPV: >=0.5 fills and crops, <0.5 letterboxes."""
+        if panscan_value >= 0.5:
+            return (
+                "increase",
+                f"crop={cell_w}:{cell_h}:(iw-{cell_w})/2:(ih-{cell_h})/2",
+            )
+        return (
+            "decrease",
+            f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black",
+        )
+
+    # ---- Drawtext font setup for per-scene filename labels ----
+    # Filter-complex string escaping: the fontfile path has a colon
+    # which is ffmpeg's filter-option separator, so we wrap it in single
+    # quotes and escape the colon with a backslash.
+    label_font_size = max(18, min(42, int(cell_h * 0.04)))
+    label_font_path = r"C\:/Windows/Fonts/arialbd.ttf"
+    label_pad = max(8, label_font_size // 3)
 
     # ---- Build inputs list and filter graph ----
     # Each scene becomes ONE -i with input-side -ss / -t, so ffmpeg seeks
@@ -2044,17 +2143,32 @@ def generate_grwm_script(session_dir):
             ))
             in_lbl = f"[{input_idx}:v]"
             scene_lbl = f"[s{input_idx}]"
+            # Per-scene fill mode from this sub-scene's panscan value.
+            scene_panscan = scene.get("panscan", panscan_final)
+            fill_mode, fill_suffix = _fill_for(scene_panscan)
+            # Drawtext label: filename stem, white @ 0.7, black border @ 0.55.
+            stem = os.path.splitext(os.path.basename(scene["filename"]))[0]
+            drawtext = (
+                f",drawtext=text='{stem}'"
+                f":fontfile='{label_font_path}'"
+                f":fontsize={label_font_size}"
+                f":fontcolor=white@0.7"
+                f":bordercolor=black@0.55"
+                f":borderw=2"
+                f":x={label_pad}"
+                f":y={label_pad}"
+            )
             # Per-scene chain:
             #  1. Session crop (matches live MPV's lavfi crop) — if cw/ch < 1.0
             #  2. setpts reset (each input has its own timebase post-seek)
-            #  3. scale with fill_mode from session_panscan (increase=fill,
-            #     decrease=letterbox)
-            #  4. fill_suffix: center crop (fill mode) or center pad
-            #     (letterbox mode), matching MPV's panscan behavior
+            #  3. scale with per-scene fill_mode (from panscan)
+            #  4. fill_suffix: center crop (fill mode) or center pad (letterbox)
+            #  5. drawtext: filename stem label in top-left
             filter_lines.append(
                 f"{in_lbl}{crop_filter}setpts=PTS-STARTPTS,"
                 f"scale={cell_w}:{cell_h}:force_original_aspect_ratio={fill_mode},"
                 f"{fill_suffix}"
+                f"{drawtext}"
                 f"{scene_lbl}"
             )
             per_scene_labels.append(scene_lbl)
@@ -2260,10 +2374,15 @@ def play_videos(config, video_list):
     global sockets, processes, person_socket_map, interrupt_event
     global session_crop_width, session_crop_height
     global session_output_w, session_output_h
+    global session_panscan, session_panscan_history
 
     # Snapshot the live crop factors so GRWM can reproduce the same view.
     session_crop_width = float(config.crop_width) if config.crop_width else 0.0
     session_crop_height = float(config.crop_height) if config.crop_height else 0.0
+    # Reset panscan state for this session and seed history with the
+    # default value so GRWM knows what was active before any +/- press.
+    session_panscan = 1.0
+    session_panscan_history = [(time.time(), 1.0)]
     # Snapshot the actual monitor/session dimensions so GRWM output matches
     # the real resolution (important for portrait/rotated setups).
     try:
