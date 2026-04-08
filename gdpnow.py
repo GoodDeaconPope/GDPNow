@@ -2134,43 +2134,54 @@ def generate_grwm_script(session_dir):
 
     def _panscan_filter_chain(panscan_value):
         """Continuous panscan scale+pad+crop chain for a given panscan in
-        [0, 1]. Replaces the old binary increase/decrease quantization.
-
-        Math (MPV-compatible):
+        [0, 1]. Math (MPV-compatible):
           fit_scale  = min(cell_w/iw, cell_h/ih)   # video fits inside cell
           fill_scale = max(cell_w/iw, cell_h/ih)   # video fills cell
           factor     = fit_scale + p * (fill_scale - fit_scale)
 
-        After scaling by `factor`, the output is somewhere between "fits
-        inside cell (letterbox)" and "fills cell (crop)". At intermediate
-        values, ONE dimension might exceed the cell while the other falls
-        short, requiring both center-pad AND center-crop.
+        The scene filter chain prefixes this with a SAR normalization
+        step (scale=trunc(ih*dar):ih,setsar=1) so downstream filters
+        see square pixels. Then this function's chain:
 
-        Filter chain:
-          1. scale=w=iw*factor:h=ih*factor  (single-quoted for comma escape)
+          1. scale=w=-2:h='ih*factor'
+             Compute height from the panscan factor expression, let
+             ffmpeg derive width from it with -2 (round to even,
+             preserves source DAR). Specifying BOTH dimensions via
+             expression produces SAR drift that pad rejects ('Padded
+             dimensions cannot be smaller than input dimensions'),
+             but -2-derived width keeps SAR within ffmpeg's tolerance.
           2. pad=max(iw, cw):max(ih, ch):centered:black
-             - grows shorter dimensions to at least cell size
+             Grows shorter dimensions to at least cell size.
           3. crop=cw:ch:centered
-             - shrinks overflowing dimensions back to cell size
+             Shrinks overflowing dimensions back to cell size.
 
-        Returns a filter-chain fragment string suitable for inclusion
-        between the setpts= and drawtext= filters.
+        This was a multi-hour debugging rabbit hole. Explained on the
+        ComputerBase German ffmpeg forum: scale with both w and h as
+        expressions computes each independently and can produce pixel
+        DAR that doesn't match source DAR, which scale compensates for
+        by stamping a non-1:1 SAR on the output. pad then uses the
+        display-adjusted dimensions (iw * sar_num/sar_den) in its
+        'output must be >= input' check and rejects valid targets.
+        Using -2 for one dimension lets ffmpeg derive it from the
+        other with even-rounding, producing dimensions that preserve
+        source DAR exactly (SAR stays near 1:1).
         """
         p = max(0.0, min(1.0, float(panscan_value)))
-        # Build expressions. Use cell_w/cell_h integer substitution inside
-        # the expression; iw/ih are evaluated per-frame by ffmpeg.
         fit_expr  = f"min({cell_w}/iw,{cell_h}/ih)"
         fill_expr = f"max({cell_w}/iw,{cell_h}/ih)"
         factor_expr = f"({fit_expr}+{p:.3f}*({fill_expr}-{fit_expr}))"
-        sw_expr = f"iw*{factor_expr}"
         sh_expr = f"ih*{factor_expr}"
-        # Single-quoted expressions to keep commas from being interpreted
-        # as filter separators by the filtergraph parser.
+        # Trailing setsar=1 forces all scene streams to exactly SAR 1:1
+        # so concat across scenes accepts them — without it, different
+        # panscan scenes produce slightly different SAR values (like
+        # 687463:687492 vs 144160:144157, both ≈1.0 but not equal) and
+        # concat rejects with 'parameters do not match'.
         return (
-            f"scale=w='{sw_expr}':h='{sh_expr}',"
+            f"scale=w=-2:h='{sh_expr}',"
             f"pad=w='max(iw\\,{cell_w})':h='max(ih\\,{cell_h})':"
             f"x='(ow-iw)/2':y='(oh-ih)/2':color=black,"
-            f"crop={cell_w}:{cell_h}:(iw-{cell_w})/2:(ih-{cell_h})/2"
+            f"crop={cell_w}:{cell_h}:(iw-{cell_w})/2:(ih-{cell_h})/2,"
+            f"setsar=1"
         )
 
     # ---- Drawtext font setup for per-scene filename labels ----
@@ -2233,12 +2244,17 @@ def generate_grwm_script(session_dir):
                 f":y={label_pad}"
             )
             # Per-scene chain:
-            #  1. Session crop (matches live MPV's lavfi crop) — if cw/ch < 1.0
-            #  2. setpts reset (each input has its own timebase post-seek)
-            #  3. continuous panscan chain (scale -> pad -> crop)
-            #  4. drawtext: filename stem label in top-left
+            #  1. SAR normalization: scale=trunc(ih*dar):ih,setsar=1
+            #     Makes pixels square before subsequent filters so the
+            #     pad filter's internal dimension check doesn't get
+            #     confused by non-1:1 SAR from earlier scale operations.
+            #  2. Session crop (matches live MPV's lavfi crop) if cw/ch < 1.0
+            #  3. setpts reset (each input has its own timebase post-seek)
+            #  4. Continuous panscan chain (scale -> pad -> crop)
+            #  5. drawtext: filename stem label in top-left
             filter_lines.append(
-                f"{in_lbl}{crop_filter}setpts=PTS-STARTPTS,"
+                f"{in_lbl}scale=trunc(ih*dar):ih,setsar=1,"
+                f"{crop_filter}setpts=PTS-STARTPTS,"
                 f"{panscan_chain}"
                 f"{drawtext}"
                 f"{scene_lbl}"
