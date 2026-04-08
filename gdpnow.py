@@ -7,6 +7,7 @@ import tempfile
 import time
 import math
 import random
+from PIL import ImageDraw, ImageFont
 
 # Reconfigure stdout/stderr to UTF-8 so prints containing non-ASCII chars
 # (e.g. U+A789 "꞉" in session IDs) don't crash on legacy cp1252 consoles.
@@ -1167,6 +1168,32 @@ processes = [] # List to hold process objects
 interrupt_event = threading.Event() # Event to signal interruption/shutdown
 person_socket_map = {} # Dictionary mapping socket index to list of assigned videos
 
+# Per-cell playback state, used by NutCounter to label screenshots.
+# Keyed by socket index (which maps to grid cell position).
+# Each entry: {"filename": str, "started_wall": float, "started_pos_sec": float}
+# started_wall = time.time() when the cell loaded this video
+# started_pos_sec = offset in seconds into the source file where playback began
+cell_state = {}
+cell_state_lock = threading.Lock()
+
+
+def _update_cell_state(socket_idx, filename, started_pos_sec):
+    """Record that socket_idx just started playing `filename` from
+    `started_pos_sec` seconds into the source. NutCounter reads this to
+    overlay labels on screenshots."""
+    with cell_state_lock:
+        cell_state[socket_idx] = {
+            "filename": filename,
+            "started_wall": time.time(),
+            "started_pos_sec": float(started_pos_sec),
+        }
+
+
+def _snapshot_cell_state():
+    """Return a shallow copy of cell_state for consumers that iterate it."""
+    with cell_state_lock:
+        return dict(cell_state)
+
 
 class NutCounter:
     """
@@ -1213,6 +1240,8 @@ class NutCounter:
         self.target_count = target_count
         self.capture_interval = capture_interval
         self.fallback_bbox = None
+        self.column_grid = 1
+        self.row_grid = 1
         self.captures = []  # list of (timestamp, tmp_file_path)
         self.tmp_dir = None
         self.final_dir = None
@@ -1224,17 +1253,21 @@ class NutCounter:
         self.base_final_dir = output_dir or self.DEFAULT_OUTPUT_DIR
         self._fallback_warned = False
         self._host_seen = False
+        self._font_cache = {}  # size -> ImageFont
 
-    def start(self, fallback_bbox):
+    def start(self, fallback_bbox, column_grid=1, row_grid=1):
         """fallback_bbox = (x1, y1, x2, y2) screen coords, used only if the
-        GridHost window can't be found via FindWindow at capture time."""
+        GridHost window can't be found via FindWindow at capture time.
+        column_grid/row_grid determine how labels are positioned per cell."""
         if self.thread is not None:
             return  # already running
         self.fallback_bbox = tuple(int(v) for v in fallback_bbox)
+        self.column_grid = max(1, int(column_grid))
+        self.row_grid = max(1, int(row_grid))
         # Regenerate session_id at actual session start (not import time).
         self.session_id = self._make_session_id()
         # tmp dir uses a filesystem-safe slug since %TEMP% tools dislike spaces/commas
-        tmp_slug = self.session_id.replace(", ", "_").replace(" ", "_").replace(".", "-")
+        tmp_slug = self.session_id.replace(", ", "_").replace(" ", "_").replace("\uA789", "-")
         self.tmp_dir = os.path.join(tempfile.gettempdir(), f"gdpnow_nuts_{tmp_slug}")
         self.final_dir = os.path.join(self.base_final_dir, self.session_id)
         try:
@@ -1246,7 +1279,74 @@ class NutCounter:
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._capture_loop, name="NutCounter", daemon=True)
         self.thread.start()
-        print(f"[NutCounter] Started. class={self.HOST_WINDOW_CLASS} fallback_bbox={self.fallback_bbox} interval={self.capture_interval}s tmp={self.tmp_dir}")
+        print(f"[NutCounter] Started. class={self.HOST_WINDOW_CLASS} grid={self.column_grid}x{self.row_grid} fallback_bbox={self.fallback_bbox} interval={self.capture_interval}s tmp={self.tmp_dir}")
+
+    def _get_font(self, size):
+        """Load Arial at the requested size, falling back to PIL default."""
+        if size in self._font_cache:
+            return self._font_cache[size]
+        font = None
+        for candidate in (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\arial.ttf"):
+            try:
+                font = ImageFont.truetype(candidate, size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+        self._font_cache[size] = font
+        return font
+
+    def _annotate(self, img):
+        """Overlay per-cell file number + timestamp labels onto the captured
+        image. Reads the global cell_state snapshot at call time."""
+        try:
+            state = _snapshot_cell_state()
+            if not state:
+                return img
+            draw = ImageDraw.Draw(img)
+            w, h = img.size
+            cell_w = w / self.column_grid
+            cell_h = h / self.row_grid
+            # Font size scales with cell height; clamp to sensible range.
+            font_size = max(14, min(36, int(cell_h * 0.06)))
+            font = self._get_font(font_size)
+            now = time.time()
+            pad = max(6, font_size // 3)
+            for socket_idx, info in state.items():
+                col = socket_idx % self.column_grid
+                row = socket_idx // self.column_grid
+                if row >= self.row_grid:
+                    continue
+                # Compute current playback position = start_pos + wall elapsed.
+                elapsed = now - info["started_wall"]
+                pos_sec = max(0.0, info["started_pos_sec"] + elapsed)
+                mm = int(pos_sec) // 60
+                ss = int(pos_sec) % 60
+                stem = os.path.splitext(os.path.basename(info["filename"]))[0]
+                label = f"{stem}  {mm:d}:{ss:02d}"
+                x = col * cell_w + pad
+                y = row * cell_h + pad
+                try:
+                    draw.text(
+                        (x, y),
+                        label,
+                        fill="white",
+                        font=font,
+                        stroke_width=2,
+                        stroke_fill="black",
+                    )
+                except TypeError:
+                    # Pillow < 8.0 doesn't support stroke_*; fake it with 4-way shadow.
+                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        draw.text((x + dx, y + dy), label, fill="black", font=font)
+                    draw.text((x, y), label, fill="white", font=font)
+        except Exception as e:
+            print(f"[NutCounter] Annotate error: {e}")
+        return img
 
     def _get_host_bbox(self):
         """Return the current client-rect of GridHost in screen coords,
@@ -1293,6 +1393,7 @@ class NutCounter:
                 self._fallback_warned = True
         try:
             img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            img = self._annotate(img)
             with self.lock:
                 idx = len(self.captures)
             ts = time.time()
@@ -1490,6 +1591,8 @@ def play_videos(config, video_list):
                     metadata["videoTime"] = config.default_duration_map.get(config.master_type, 60)
 
         command_list = create_mpv_command(first_filename, first_start_time_str, geometry, config, i)
+        # Record what this cell is showing for NutCounter label overlay.
+        _update_cell_state(i, first_filename, mmss_to_seconds(first_start_time_str))
         process = None
         if config.production and command_list:
             print(f"    Starting MPV for: {first_filename}")
@@ -1564,7 +1667,7 @@ def play_videos(config, video_list):
             int(config.monitor_offset[0] + config.input_geometry[0]),
             int(config.monitor_offset[1] + config.input_geometry[1]),
         )
-        nut_counter.start(bbox)
+        nut_counter.start(bbox, column_grid=config.column_grid, row_grid=config.row_grid)
     except Exception as e:
         print(f"[NutCounter] Failed to start: {e}")
 
@@ -1907,6 +2010,8 @@ def cycle_videos(config):
 
             cmd = f'loadfile {v["filename"]} replace "start={final_start_str}"'
             send_command_to_socket_index(socket_idx, cmd)
+            # Record new state for NutCounter label overlay.
+            _update_cell_state(socket_idx, v["filename"], mmss_to_seconds(final_start_str))
 
         # 🔥 If everything is dead, just bail out
         if len(dead_sockets) == len(active_socket_indices):
