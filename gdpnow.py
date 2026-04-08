@@ -1163,39 +1163,64 @@ class NutCounter:
     """
     Periodic screen-region capture with guaranteed final-count output.
 
-    - Captures the configured bbox every `capture_interval` seconds to a tmp
-      dir on disk (survives crash).
+    - Captures the GridHost window's CLIENT area every `capture_interval`
+      seconds. Client area == the actual video grid, excluding title bar.
+      Resolved via win32 FindWindow at each capture, so resizing/moving
+      the container is handled automatically.
+    - If the host window can't be found (e.g. not created yet, destroyed,
+      minimized), falls back to the static `fallback_bbox` passed to start().
     - On finalize(), selects exactly `target_count` captures evenly spaced
-      across the session and copies them to the final output dir with
-      descriptive filenames.
-    - If buffer has fewer than `target_count` captures at finalize time
-      (e.g. very short session), takes rapid emergency fill captures before
-      MPVs are killed.
-    - finalize() is idempotent — safe to call from multiple shutdown paths.
+      across the session and copies them to the final output dir.
+    - If buffer has fewer than `target_count` captures at finalize time,
+      takes rapid emergency fill captures before MPVs are killed.
+    - finalize() is idempotent.
     """
 
     DEFAULT_OUTPUT_DIR = r"%USERPROFILE%\Pictures\gdpnow_nuts"
+    HOST_WINDOW_CLASS = "GridHostWindowClass"
+
+    @staticmethod
+    def _make_session_id():
+        """Human-readable session ID for the folder name.
+        Format: "4.21 AM, April 8th 2026"  (colon replaced with '.' — Windows
+        filesystem forbids ':' in paths)."""
+        now = datetime.datetime.now()
+        # 12-hour time; lstrip leading zero on hour ("04" -> "4")
+        time_str = now.strftime("%I.%M %p").lstrip("0")
+        day = now.day
+        if 10 <= day % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        return f"{time_str}, {now.strftime('%B')} {day}{suffix} {now.year}"
 
     def __init__(self, target_count=10, capture_interval=1.0, output_dir=None):
         self.target_count = target_count
         self.capture_interval = capture_interval
-        self.bbox = None
+        self.fallback_bbox = None
         self.captures = []  # list of (timestamp, tmp_file_path)
         self.tmp_dir = None
         self.final_dir = None
-        self.session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        self.session_id = self._make_session_id()
         self.stop_event = threading.Event()
         self.thread = None
         self.finalized = False
         self.lock = threading.Lock()
         self.base_final_dir = output_dir or self.DEFAULT_OUTPUT_DIR
+        self._fallback_warned = False
+        self._host_seen = False
 
-    def start(self, bbox):
-        """bbox = (x1, y1, x2, y2) absolute screen coordinates."""
+    def start(self, fallback_bbox):
+        """fallback_bbox = (x1, y1, x2, y2) screen coords, used only if the
+        GridHost window can't be found via FindWindow at capture time."""
         if self.thread is not None:
             return  # already running
-        self.bbox = tuple(int(v) for v in bbox)
-        self.tmp_dir = os.path.join(tempfile.gettempdir(), f"gdpnow_nuts_{self.session_id}")
+        self.fallback_bbox = tuple(int(v) for v in fallback_bbox)
+        # Regenerate session_id at actual session start (not import time).
+        self.session_id = self._make_session_id()
+        # tmp dir uses a filesystem-safe slug since %TEMP% tools dislike spaces/commas
+        tmp_slug = self.session_id.replace(", ", "_").replace(" ", "_").replace(".", "-")
+        self.tmp_dir = os.path.join(tempfile.gettempdir(), f"gdpnow_nuts_{tmp_slug}")
         self.final_dir = os.path.join(self.base_final_dir, self.session_id)
         try:
             os.makedirs(self.tmp_dir, exist_ok=True)
@@ -1206,7 +1231,27 @@ class NutCounter:
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._capture_loop, name="NutCounter", daemon=True)
         self.thread.start()
-        print(f"[NutCounter] Started. bbox={self.bbox} interval={self.capture_interval}s tmp={self.tmp_dir}")
+        print(f"[NutCounter] Started. class={self.HOST_WINDOW_CLASS} fallback_bbox={self.fallback_bbox} interval={self.capture_interval}s tmp={self.tmp_dir}")
+
+    def _get_host_bbox(self):
+        """Return the current client-rect of GridHost in screen coords,
+        or None if not found/usable."""
+        try:
+            hwnd = win32gui.FindWindow(self.HOST_WINDOW_CLASS, None)
+            if not hwnd:
+                return None
+            if not win32gui.IsWindowVisible(hwnd):
+                return None
+            if win32gui.IsIconic(hwnd):  # minimized
+                return None
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            tl = win32gui.ClientToScreen(hwnd, (left, top))
+            br = win32gui.ClientToScreen(hwnd, (right, bottom))
+            if br[0] - tl[0] < 10 or br[1] - tl[1] < 10:
+                return None  # degenerate rect
+            return (tl[0], tl[1], br[0], br[1])
+        except Exception:
+            return None
 
     def _capture_loop(self):
         # First capture immediately so even a 0s session has something.
@@ -1217,15 +1262,26 @@ class NutCounter:
             self._capture_one()
 
     def _capture_one(self):
-        if self.bbox is None or self.tmp_dir is None:
+        if self.tmp_dir is None:
             return
+        bbox = self._get_host_bbox()
+        if bbox is not None:
+            if not self._host_seen:
+                print(f"[NutCounter] Host window found, capturing client area: {bbox}")
+                self._host_seen = True
+        else:
+            bbox = self.fallback_bbox
+            if bbox is None:
+                return
+            if not self._fallback_warned:
+                print(f"[NutCounter] Host window not found, using fallback bbox: {bbox}")
+                self._fallback_warned = True
         try:
-            img = ImageGrab.grab(bbox=self.bbox, all_screens=True)
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
             with self.lock:
                 idx = len(self.captures)
             ts = time.time()
             path = os.path.join(self.tmp_dir, f"cap_{idx:05d}.png")
-            # compress_level=1 = fast, big-ish files. Fine for NVMe tmp.
             img.save(path, "PNG", compress_level=1)
             with self.lock:
                 self.captures.append((ts, path))
