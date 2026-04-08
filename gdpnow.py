@@ -1974,9 +1974,23 @@ def generate_grwm_script(session_dir):
                 break
         return active
 
+    def _fill_class(panscan_value):
+        """Classify a panscan value by its filter output. Currently the
+        filter chain quantizes at 0.5 — all values >=0.5 produce the
+        identical fill/crop chain, all values <0.5 produce the identical
+        letterbox/pad chain. Adjacent sub-scenes in the same class can
+        be merged into one input without changing the output pixel."""
+        return "fill" if panscan_value >= 0.5 else "letterbox"
+
     def _split_scene_by_panscan(filename, in_sec, wall_start, wall_end):
-        """Split a scene into sub-scenes at panscan change points.
-        Each sub-scene has a constant panscan value.
+        """Split a scene into sub-scenes at panscan change points, then
+        merge adjacent sub-scenes in the same fill class so we don't
+        spawn a separate ffmpeg -i per tiny panscan tweak that doesn't
+        actually change the output. Without this merge, a user who
+        rapidly spams +/- during a scene can produce 70+ sub-scenes per
+        cell even though they all render identically — that was the
+        "142 scenes lags my computer" incident.
+
         Returns list of {filename, in_sec, duration, panscan}."""
         scene_duration = wall_end - wall_start
         if scene_duration <= 0:
@@ -1994,14 +2008,15 @@ def generate_grwm_script(session_dir):
                 "duration": scene_duration,
                 "panscan": current_panscan,
             }]
-        sub_scenes = []
+        # 1. Raw split at every panscan change.
+        raw_subs = []
         sub_wall = wall_start
         sub_in = in_sec
         sub_panscan = current_panscan
         for change_wall, new_value in changes_in_window:
             sub_duration = change_wall - sub_wall
             if sub_duration > 0.01:
-                sub_scenes.append({
+                raw_subs.append({
                     "filename": filename,
                     "in_sec": sub_in,
                     "duration": sub_duration,
@@ -2012,13 +2027,27 @@ def generate_grwm_script(session_dir):
             sub_panscan = new_value
         final_duration = wall_end - sub_wall
         if final_duration > 0.01:
-            sub_scenes.append({
+            raw_subs.append({
                 "filename": filename,
                 "in_sec": sub_in,
                 "duration": final_duration,
                 "panscan": sub_panscan,
             })
-        return sub_scenes
+        # 2. Merge adjacent sub-scenes in the same fill class.
+        if len(raw_subs) <= 1:
+            return raw_subs
+        merged = [dict(raw_subs[0])]
+        for s in raw_subs[1:]:
+            prev = merged[-1]
+            if _fill_class(prev["panscan"]) == _fill_class(s["panscan"]):
+                # Same filter output — just extend the previous sub-scene's
+                # duration. in_sec stays the same (we're reading contiguous
+                # source content). The exact panscan value is irrelevant
+                # because the filter quantizes it anyway.
+                prev["duration"] += s["duration"]
+            else:
+                merged.append(dict(s))
+        return merged
 
     # ---- Group history by cell, compute per-scene durations ----
     by_socket = {}
