@@ -2087,6 +2087,32 @@ def generate_grwm_script(session_dir):
     if total_panscan_splits > 0:
         print(f"[GRWM] Time-varying panscan: split {total_panscan_splits} extra sub-scenes across {grid_size} cells")
 
+    # ---- Minimum sub-scene duration pass ----
+    # Rapid +/- keypresses can produce sub-scenes as short as 30ms (less
+    # than one frame at 29.97 fps). ffmpeg's concat filter then has frame
+    # gaps at the boundaries, which xstack composites as visible
+    # stutter / frame rate loss on one cell. Collapse sub-scenes below
+    # MIN_SCENE_DUR into the previous scene (keeping the previous's
+    # panscan value since the short one is imperceptible anyway).
+    MIN_SCENE_DUR = 0.5  # seconds — ~15 frames at 30fps, visually meaningful
+    total_collapsed = 0
+    for socket_idx in range(grid_size):
+        scenes = cell_scenes[socket_idx]
+        if len(scenes) <= 1:
+            continue
+        merged = [dict(scenes[0])]
+        for s in scenes[1:]:
+            if s["duration"] < MIN_SCENE_DUR:
+                # Absorb into previous scene (keep previous's panscan,
+                # extend its duration by the short scene's duration).
+                merged[-1]["duration"] += s["duration"]
+                total_collapsed += 1
+            else:
+                merged.append(dict(s))
+        cell_scenes[socket_idx] = merged
+    if total_collapsed > 0:
+        print(f"[GRWM] Collapsed {total_collapsed} sub-scenes shorter than {MIN_SCENE_DUR}s across {grid_size} cells")
+
     # ---- Output dimensions ----
     # Match the live session resolution (respects portrait/rotated setups).
     # Falls back to 1920x1080 only if the session globals were never set.
