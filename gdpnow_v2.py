@@ -1135,133 +1135,122 @@ person_socket_map = {} # Dictionary mapping socket index to list of assigned vid
 
 
 class SmartProxyManager:
-    def __init__(self, output_height=540, max_workers=4):
-        self.output_height = int(output_height)
-        # Thread pool: 4 workers allows 4 segments to generate simultaneously
+    def __init__(self, max_workers=8):
+        # Stream-copy workers are mostly IO-bound, so bumping from 4->8 cuts
+        # queue latency for large grids without meaningful CPU cost.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-        self.futures = {} 
+        self.futures = {}
         self.lock = threading.Lock()
         self.running = True
-        self.ffmpeg_pids = set() # Track PIDs for shutdown
+        self.ffmpeg_pids = set()  # Track PIDs for shutdown
 
     def shutdown(self):
         self.running = False
         self.executor.shutdown(wait=False)
         # Nuclear option for PIDs is handled in force_shutdown
 
-    def get_segment_path(self, original_path, start_time, duration):
-        """
-        Returns path to segment if ready, else None.
-        """
+    def _seg_paths(self, original_path, start_time, duration):
         original_path = os.path.abspath(original_path)
         base, ext = os.path.splitext(original_path)
-        # Filename includes Duration so it adapts if you change settings
-        seg_name = f"{base}_seg_{int(start_time)}_{int(duration)}_{self.output_height}p.mp4"
-        
+        seg_name = f"{base}_seg_{int(start_time)}_{int(duration)}_copy.mp4"
+        temp_name = f"{base}_seg_{int(start_time)}_{int(duration)}_temp.mp4"
+        return seg_name, temp_name
+
+    def get_segment_path(self, original_path, start_time, duration):
+        """Returns path to segment if ready, else None."""
+        seg_name, _ = self._seg_paths(original_path, start_time, duration)
         if os.path.exists(seg_name):
             return seg_name
         return None
 
     def request_segment(self, original_path, start_time, duration):
-        """
-        Submits a job to generate this specific time slice.
-        """
-        if not self.running: return
+        """Submits a job to generate this specific time slice (idempotent)."""
+        if not self.running:
+            return
 
+        seg_name, temp_name = self._seg_paths(original_path, start_time, duration)
         original_path = os.path.abspath(original_path)
-        base, ext = os.path.splitext(original_path)
-        seg_name = f"{base}_seg_{int(start_time)}_{int(duration)}_{self.output_height}p.mp4"
-        temp_name = f"{base}_seg_{int(start_time)}_{int(duration)}_temp.mp4"
 
-        if os.path.exists(seg_name): return
+        if os.path.exists(seg_name):
+            return
         with self.lock:
-            if seg_name in self.futures: return
+            if seg_name in self.futures:
+                return
 
-        # Submit job
         future = self.executor.submit(
-            self._hybrid_generate_worker, 
+            self._copy_generate_worker,
             original_path, seg_name, temp_name, start_time, duration
         )
-        
+
         with self.lock:
             self.futures[seg_name] = future
 
-    def _hybrid_generate_worker(self, input_path, output_path, temp_path, start_time, duration):
-        if not self.running: return
-        
-        # --- HYBRID ACCURATE SEEK ---
-        # 1. We jump to 'fast_seek' (Hardware seek). This is instant but inaccurate.
-        # 2. We set 'slow_seek' (Software decode). This processes the gap to find the exact frame.
-        # 3. 10s buffer is usually enough to cover any Keyframe Interval (GOP).
-        SEEK_BUFFER = 10.0
+    def _copy_generate_worker(self, input_path, output_path, temp_path, start_time, duration):
+        """
+        Stream-copy segment generator. ~50x faster than re-encoding because
+        ffmpeg just copies packets. Trade-off: segment snaps to nearest
+        keyframe <= start_time (typically 2-5s off on modern MP4s). Fine for
+        grid cycling where exact frame alignment doesn't matter.
+        """
+        if not self.running:
+            return
 
-        if start_time > SEEK_BUFFER:
-            fast_seek = start_time - SEEK_BUFFER 
-            slow_seek = SEEK_BUFFER              
-        else:
-            fast_seek = 0.0
-            slow_seek = start_time
+        t_start = time.monotonic()
 
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            
-            # 1. FAST JUMP (Input Option)
-            "-ss", f"{fast_seek:.3f}",
-            
+            "-ss", f"{start_time:.3f}",   # Fast input seek (keyframe-aligned)
             "-i", input_path,
-            
-            # 2. ACCURATE DECODE (Output Option)
-            "-ss", f"{slow_seek:.3f}",
-            
-            # 3. CUT DURATION
             "-t", f"{duration:.3f}",
-            
-            "-vf", f"scale=-2:{self.output_height}",
-            "-c:v", "libx264", 
-            "-preset", "ultrafast", 
-            "-crf", "20", 
+            "-c:v", "copy",
             "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
             temp_path
         ]
 
         proc = None
         try:
-            # Low Priority Flags for Windows
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
+
             proc = subprocess.Popen(
-                cmd, 
-                startupinfo=startupinfo, 
-                creationflags=0x00004000 # BELOW_NORMAL_PRIORITY_CLASS
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                startupinfo=startupinfo,
+                creationflags=0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
             )
-            
+
             with self.lock:
                 self.ffmpeg_pids.add(proc.pid)
-            
-            proc.wait()
-            
+
+            _, stderr = proc.communicate()
+
             with self.lock:
-                if proc.pid in self.ffmpeg_pids: self.ffmpeg_pids.remove(proc.pid)
+                self.ffmpeg_pids.discard(proc.pid)
+
+            elapsed = time.monotonic() - t_start
 
             if self.running and proc.returncode == 0 and os.path.exists(temp_path):
                 os.replace(temp_path, output_path)
-                # print(f"[JIT] Segment Ready: {os.path.basename(output_path)}")
+                print(f"[JIT OK {elapsed:.2f}s] {os.path.basename(output_path)}")
             else:
-                if os.path.exists(temp_path): os.remove(temp_path)
-                
+                if self.running:
+                    err_text = (stderr or b"").decode(errors='ignore').strip()[:200]
+                    print(f"[JIT FAIL {elapsed:.2f}s] {os.path.basename(input_path)}@{start_time:.0f}s rc={proc.returncode}: {err_text}")
+                if os.path.exists(temp_path):
+                    try: os.remove(temp_path)
+                    except OSError: pass
+
         except Exception as e:
-            # print(f"Seg Error: {e}")
-            if os.path.exists(temp_path): os.remove(temp_path)
-        finally:
-            # Cleanup future tracking
-            with self.lock:
-                # We don't remove from futures dict immediately to prevent 
-                # re-queueing the same job instantly if loop is fast.
-                # Ideally, we let it sit or use a 'completed' set.
-                pass
+            if self.running:
+                print(f"[JIT EXCEPTION] {os.path.basename(input_path)}@{start_time:.0f}s: {e}")
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except OSError: pass
+
 # Initialize Global
-proxy_manager = SmartProxyManager(output_height=540)
+proxy_manager = SmartProxyManager()
 
 def play_videos(config, video_list):
     """
@@ -1534,13 +1523,14 @@ def cycle_videos(config):
         abs_start = v["base_sec"] + offsets[occ_idx]
         return v["filename"], abs_start
 
-    # --- 3. Pre-Queue Switch #1 ---
+    # --- 3. Pre-Queue Switches 1..3 (triple-buffered head start) ---
     if proxy_manager:
-        print("[Lookahead] Queueing segments for Switch #1...")
-        for s_idx in active_socket_indices:
-            fname, fstart = get_predictive_params(s_idx, 1)
-            if fname:
-                proxy_manager.request_segment(fname, fstart, interval)
+        print("[Lookahead] Pre-queueing segments for Switches 1..3...")
+        for pre_switch in range(1, min(4, num_switches + 1)):
+            for s_idx in active_socket_indices:
+                fname, fstart = get_predictive_params(s_idx, pre_switch)
+                if fname:
+                    proxy_manager.request_segment(fname, fstart, interval)
 
     def send_cmd(idx, cmd_str):
         try:
@@ -1559,13 +1549,15 @@ def cycle_videos(config):
 
         print(f"--- Cycle Switch {switch_idx}/{num_switches} ---")
 
-        # A. TRIGGER LOOKAHEAD for NEXT switch (Switch + 1)
-        next_switch = switch_idx + 1
-        if proxy_manager and next_switch <= num_switches:
-            for s_idx in active_socket_indices:
-                fname, fstart = get_predictive_params(s_idx, next_switch)
-                if fname:
-                    proxy_manager.request_segment(fname, fstart, interval)
+        # A. TRIGGER LOOKAHEAD: queue switch+2 and switch+3 (maintain 3-deep buffer)
+        #    switch+1 should already be queued from previous iteration's lookahead
+        #    or from the pre-queue phase.
+        for la_switch in (switch_idx + 2, switch_idx + 3):
+            if proxy_manager and la_switch <= num_switches:
+                for s_idx in active_socket_indices:
+                    fname, fstart = get_predictive_params(s_idx, la_switch)
+                    if fname:
+                        proxy_manager.request_segment(fname, fstart, interval)
 
         # B. PLAY CURRENT
         for s_idx in active_socket_indices:
