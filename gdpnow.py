@@ -1465,9 +1465,16 @@ class NutCounter:
         self.base_final_dir = output_dir or self.DEFAULT_OUTPUT_DIR
         self._fallback_warned = False
         self._host_seen = False
+        self._host_first_seen_at = 0.0  # monotonic time of first successful find
         self._last_host_bbox = None  # last known good host rect
         self._skipped_pre_host = 0   # counter for early skipped captures
         self._font_cache = {}  # size -> ImageFont
+        # After GridHost first appears, wait this long before the first
+        # real capture. MPV windows exist (GridHost wraps them) but they
+        # might still be rendering their first frames — capturing during
+        # that window yields a black cell that ends up as the first
+        # screenshot in the final selection.
+        self._startup_settle_sec = 2.0
 
     def start(self, fallback_bbox, column_grid=1, row_grid=1):
         """fallback_bbox = (x1, y1, x2, y2) screen coords, used only if the
@@ -1609,7 +1616,17 @@ class NutCounter:
             if not self._host_seen:
                 print(f"[NutCounter] Host window found after skipping {self._skipped_pre_host} pre-host captures: {bbox}")
                 self._host_seen = True
+                self._host_first_seen_at = time.monotonic()
             self._last_host_bbox = bbox
+            # Startup settle: after host first appears, skip captures
+            # until MPV has had a moment to render its first frames. The
+            # GridHost window exists before MPV children finish their
+            # initial loadfile sequence, so capturing immediately yields
+            # black cells. Wait _startup_settle_sec after first sight.
+            elapsed_since_host = time.monotonic() - self._host_first_seen_at
+            if elapsed_since_host < self._startup_settle_sec:
+                self._skipped_pre_host += 1
+                return
         else:
             if not self._host_seen:
                 # Host never appeared yet — skip this capture entirely so
