@@ -1,9 +1,12 @@
 import tkinter as tk
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import math
 import random
+from PIL import ImageGrab
 # import screenGeo ...
 import sys
 # import msvcrt ...
@@ -1155,6 +1158,156 @@ processes = [] # List to hold process objects
 interrupt_event = threading.Event() # Event to signal interruption/shutdown
 person_socket_map = {} # Dictionary mapping socket index to list of assigned videos
 
+
+class NutCounter:
+    """
+    Periodic screen-region capture with guaranteed final-count output.
+
+    - Captures the configured bbox every `capture_interval` seconds to a tmp
+      dir on disk (survives crash).
+    - On finalize(), selects exactly `target_count` captures evenly spaced
+      across the session and copies them to the final output dir with
+      descriptive filenames.
+    - If buffer has fewer than `target_count` captures at finalize time
+      (e.g. very short session), takes rapid emergency fill captures before
+      MPVs are killed.
+    - finalize() is idempotent — safe to call from multiple shutdown paths.
+    """
+
+    DEFAULT_OUTPUT_DIR = r"%USERPROFILE%\Pictures\gdpnow_nuts"
+
+    def __init__(self, target_count=10, capture_interval=1.0, output_dir=None):
+        self.target_count = target_count
+        self.capture_interval = capture_interval
+        self.bbox = None
+        self.captures = []  # list of (timestamp, tmp_file_path)
+        self.tmp_dir = None
+        self.final_dir = None
+        self.session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.finalized = False
+        self.lock = threading.Lock()
+        self.base_final_dir = output_dir or self.DEFAULT_OUTPUT_DIR
+
+    def start(self, bbox):
+        """bbox = (x1, y1, x2, y2) absolute screen coordinates."""
+        if self.thread is not None:
+            return  # already running
+        self.bbox = tuple(int(v) for v in bbox)
+        self.tmp_dir = os.path.join(tempfile.gettempdir(), f"gdpnow_nuts_{self.session_id}")
+        self.final_dir = os.path.join(self.base_final_dir, self.session_id)
+        try:
+            os.makedirs(self.tmp_dir, exist_ok=True)
+            os.makedirs(self.final_dir, exist_ok=True)
+        except OSError as e:
+            print(f"[NutCounter] Could not create dirs: {e}")
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._capture_loop, name="NutCounter", daemon=True)
+        self.thread.start()
+        print(f"[NutCounter] Started. bbox={self.bbox} interval={self.capture_interval}s tmp={self.tmp_dir}")
+
+    def _capture_loop(self):
+        # First capture immediately so even a 0s session has something.
+        self._capture_one()
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(timeout=self.capture_interval):
+                break
+            self._capture_one()
+
+    def _capture_one(self):
+        if self.bbox is None or self.tmp_dir is None:
+            return
+        try:
+            img = ImageGrab.grab(bbox=self.bbox, all_screens=True)
+            with self.lock:
+                idx = len(self.captures)
+            ts = time.time()
+            path = os.path.join(self.tmp_dir, f"cap_{idx:05d}.png")
+            # compress_level=1 = fast, big-ish files. Fine for NVMe tmp.
+            img.save(path, "PNG", compress_level=1)
+            with self.lock:
+                self.captures.append((ts, path))
+        except Exception as e:
+            print(f"[NutCounter] Capture error: {e}")
+
+    def finalize(self):
+        """Stop the capture thread, fill to target if short, save final PNGs.
+        Idempotent — calling twice is a no-op."""
+        with self.lock:
+            if self.finalized:
+                return
+            self.finalized = True
+
+        if self.thread is None:
+            # Never started. Nothing to do.
+            return
+
+        buf_len = len(self.captures)
+        print(f"[NutCounter] Finalizing. {buf_len} captures in buffer.")
+        self.stop_event.set()
+        try:
+            self.thread.join(timeout=2.0)
+        except Exception:
+            pass
+
+        # Emergency fill: session too short to hit target naturally.
+        # Screen is still alive at this point (caller must not have killed MPVs yet).
+        emergency_budget = 50  # max extra attempts
+        while len(self.captures) < self.target_count and emergency_budget > 0:
+            prev = len(self.captures)
+            self._capture_one()
+            if len(self.captures) == prev:
+                break  # capture itself failed, stop trying
+            emergency_budget -= 1
+            time.sleep(0.05)
+
+        if not self.captures:
+            print("[NutCounter] WARNING: no captures collected. Nothing to save.")
+            return
+
+        # Select evenly spaced indices.
+        n = len(self.captures)
+        target = min(self.target_count, n)
+        if target == 1:
+            selected_indices = [0]
+        elif n <= self.target_count:
+            selected_indices = list(range(n))
+        else:
+            selected_indices = [round(i * (n - 1) / (self.target_count - 1)) for i in range(self.target_count)]
+
+        # Save with descriptive filenames.
+        session_start_ts = self.captures[0][0]
+        saved = 0
+        total = len(selected_indices)
+        for scene_num, cap_idx in enumerate(selected_indices, start=1):
+            ts, src_path = self.captures[cap_idx]
+            elapsed = ts - session_start_ts
+            wall = datetime.datetime.fromtimestamp(ts).strftime("%H%M%S")
+            dest_name = f"scene_{scene_num:02d}_of_{total:02d}_t{elapsed:07.1f}s_{wall}.png"
+            dest_path = os.path.join(self.final_dir, dest_name)
+            try:
+                shutil.copy2(src_path, dest_path)
+                saved += 1
+            except Exception as e:
+                print(f"[NutCounter] Save failed for {dest_name}: {e}")
+
+        print(f"[NutCounter] Saved {saved}/{total} screenshots to {self.final_dir}")
+
+        # Clean up tmp dir (best-effort).
+        try:
+            for _, p in self.captures:
+                try: os.remove(p)
+                except OSError: pass
+            os.rmdir(self.tmp_dir)
+        except Exception:
+            pass
+
+
+nut_counter = NutCounter()
+
+
 def play_videos(config, video_list):
     """Starts MPV instances based on config and video list, prepares for cycling."""
     global sockets, processes, person_socket_map, interrupt_event
@@ -1331,6 +1484,18 @@ def play_videos(config, video_list):
          print("\nError: No MPV instances could be started successfully. Exiting.")
          cleanup_resources()
          return
+
+    # --- Start NutCounter ---
+    try:
+        bbox = (
+            int(config.monitor_offset[0]),
+            int(config.monitor_offset[1]),
+            int(config.monitor_offset[0] + config.input_geometry[0]),
+            int(config.monitor_offset[1] + config.input_geometry[1]),
+        )
+        nut_counter.start(bbox)
+    except Exception as e:
+        print(f"[NutCounter] Failed to start: {e}")
 
     # --- Main Application Loop ---
     if config.production:
@@ -1697,6 +1862,13 @@ def cleanup_resources():
         print("Setting interrupt event during cleanup...")
         interrupt_event.set()
 
+    # Save nut screenshots before killing MPVs (idempotent — safe if
+    # force_shutdown_and_exit already called this).
+    try:
+        nut_counter.finalize()
+    except Exception as e:
+        print(f"[NutCounter] Finalize failed in cleanup: {e}")
+
     # --- Close IPC clients ---
     print(f"Closing {len(sockets)} socket handles...")
     closed_count = 0
@@ -1751,6 +1923,14 @@ def force_shutdown_and_exit():
     """
     global processes
     print("\n--- IMMEDIATE SHUTDOWN INITIATED ---")
+
+    # Save nut screenshots BEFORE killing MPVs — the emergency-fill path
+    # in NutCounter.finalize() needs the screen to still be alive if the
+    # buffer is short of the target count.
+    try:
+        nut_counter.finalize()
+    except Exception as e:
+        print(f"[NutCounter] Finalize failed in force_shutdown: {e}")
 
     # Create a copy of the list to kill from, to avoid modification issues
     procs_to_kill = list(processes)
