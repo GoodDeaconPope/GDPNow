@@ -1383,7 +1383,24 @@ session_video_pan_y = 0.0
 session_video_pan_history = []  # list of (wall_time, x, y)
 
 # arrow-key video-pan adjustment step (fraction of output cell width/height)
-VIDEO_PAN_STEP = 0.05
+# This is the *per-tap* step when the key is briefly pressed and released
+# (single discrete movement). Held-down arrow keys use a separate smooth
+# animation thread (see _pan_animator below) with a smaller per-tick delta
+# so motion looks fluid instead of jerky 5% jumps.
+VIDEO_PAN_STEP = 0.03
+
+# Smooth-pan animation constants. While any arrow key is held, a single
+# background thread ticks at PAN_TICK_HZ and emits PAN_TICK_STEP-sized
+# deltas for each held direction. Rate math: 33Hz * 0.015 = ~50%/sec held
+# pan, so the full [-1, 1] range takes ~4s of sustained hold — slow enough
+# to stop on a specific spot, fast enough not to feel sluggish.
+PAN_TICK_HZ = 33
+PAN_TICK_STEP = 0.015
+
+# Held-state + animator thread globals (see _pan_key_down / _pan_animator)
+_pan_held = {("x", +1): False, ("x", -1): False, ("y", +1): False, ("y", -1): False}
+_pan_thread = None
+_pan_thread_lock = threading.Lock()
 
 
 def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
@@ -1869,12 +1886,16 @@ def adjust_panscan(delta):
     print(f"[panscan] {sign}{delta:.2f} -> {sent} ok, {failed} failed | session_panscan = {session_panscan:.2f}", flush=True)
 
 
-def _adjust_video_pan(axis, delta):
+def _adjust_video_pan(axis, delta, quiet=False):
     """Send an 'add video-pan-<axis> <delta>' command to every active cell
     via a fresh pipe handle per cell. `axis` must be 'x' or 'y'. MPV clamps
     the resulting value to [-3.0, 3.0] automatically but we clamp our
     mirrored tracker to a tighter [-1.0, 1.0] because anything past that
     pushes the video into empty cell margin (black bars).
+
+    `quiet=True` suppresses the per-call log line — used by the smooth-pan
+    animator thread which ticks at PAN_TICK_HZ and would otherwise spam the
+    console with 30+ lines per second of sustained hold.
 
     Mirrors adjust_panscan()'s structure: fresh short-lived pipe writes via
     _send_fresh(), no-osd prefix to suppress flashing overlay text, and
@@ -1886,11 +1907,18 @@ def _adjust_video_pan(axis, delta):
         print(f"[video-pan] invalid axis {axis!r}", flush=True)
         return
     if axis == "x":
-        new_value = max(-1.0, min(1.0, session_video_pan_x + delta))
-        session_video_pan_x = new_value
+        # Clamp-aware delta: if already at the wall, skip the IPC write
+        # entirely so the animator doesn't hammer cells with no-op commands
+        # when the user holds an arrow against the pan limit.
+        clamped_new = max(-1.0, min(1.0, session_video_pan_x + delta))
+        if clamped_new == session_video_pan_x:
+            return
+        session_video_pan_x = clamped_new
     else:
-        new_value = max(-1.0, min(1.0, session_video_pan_y + delta))
-        session_video_pan_y = new_value
+        clamped_new = max(-1.0, min(1.0, session_video_pan_y + delta))
+        if clamped_new == session_video_pan_y:
+            return
+        session_video_pan_y = clamped_new
     session_video_pan_history.append(
         (time.time(), session_video_pan_x, session_video_pan_y)
     )
@@ -1905,13 +1933,15 @@ def _adjust_video_pan(axis, delta):
             sent += 1
         else:
             failed += 1
-            print(f"[video-pan-{axis}] socket {i}: {status}", flush=True)
-    sign = "+" if delta > 0 else ""
-    print(
-        f"[video-pan-{axis}] {sign}{delta:.2f} -> {sent} ok, {failed} failed | "
-        f"session = ({session_video_pan_x:+.2f}, {session_video_pan_y:+.2f})",
-        flush=True,
-    )
+            if not quiet:
+                print(f"[video-pan-{axis}] socket {i}: {status}", flush=True)
+    if not quiet:
+        sign = "+" if delta > 0 else ""
+        print(
+            f"[video-pan-{axis}] {sign}{delta:.2f} -> {sent} ok, {failed} failed | "
+            f"session = ({session_video_pan_x:+.2f}, {session_video_pan_y:+.2f})",
+            flush=True,
+        )
 
 
 def adjust_video_pan_x(delta):
@@ -1930,6 +1960,70 @@ def adjust_video_pan_y(delta):
     cell by `delta` fraction of cell height. Only visible when the video is
     clipped top/bottom."""
     _adjust_video_pan("y", delta)
+
+
+def _pan_animator():
+    """Background thread: while any arrow key is held, emit small pan deltas
+    at PAN_TICK_HZ so motion looks smooth instead of discrete-step jerky.
+
+    Exits when all arrow keys are released. Only one instance of this
+    thread runs at a time (enforced by _pan_thread_lock in _pan_key_down).
+
+    Held state is read under _pan_thread_lock to stay consistent with
+    _pan_key_down / _pan_key_up, but the IPC writes themselves happen
+    OUTSIDE the lock so a slow _send_fresh doesn't block keydown/keyup
+    events (which are on pynput's listener thread)."""
+    global _pan_thread
+    period = 1.0 / PAN_TICK_HZ
+    try:
+        while True:
+            with _pan_thread_lock:
+                if not any(_pan_held.values()):
+                    _pan_thread = None
+                    return
+                # net direction = +sign if held, minus opposite sign if held
+                dx = (
+                    (PAN_TICK_STEP if _pan_held[("x", +1)] else 0.0)
+                    - (PAN_TICK_STEP if _pan_held[("x", -1)] else 0.0)
+                )
+                dy = (
+                    (PAN_TICK_STEP if _pan_held[("y", +1)] else 0.0)
+                    - (PAN_TICK_STEP if _pan_held[("y", -1)] else 0.0)
+                )
+            if dx != 0.0:
+                _adjust_video_pan("x", dx, quiet=True)
+            if dy != 0.0:
+                _adjust_video_pan("y", dy, quiet=True)
+            time.sleep(period)
+    except Exception as e:
+        print(f"[pan-animator] error: {e}", flush=True)
+        with _pan_thread_lock:
+            _pan_thread = None
+
+
+def _pan_key_down(axis, sign):
+    """Arrow keydown: mark the (axis, sign) direction held and start the
+    animator thread if not already running. Re-entrant: OS key-repeat fires
+    on_press multiple times while the key is physically held, and those
+    repeated calls become no-ops here (held flag already True)."""
+    global _pan_thread
+    with _pan_thread_lock:
+        if _pan_held.get((axis, sign), False):
+            return  # OS key-repeat, already tracked
+        _pan_held[(axis, sign)] = True
+        if _pan_thread is None or not _pan_thread.is_alive():
+            t = threading.Thread(
+                target=_pan_animator, daemon=True, name="PanAnimator"
+            )
+            _pan_thread = t
+            t.start()
+
+
+def _pan_key_up(axis, sign):
+    """Arrow keyup: clear the (axis, sign) held flag. The animator thread
+    will notice on its next tick and exit when all directions are clear."""
+    with _pan_thread_lock:
+        _pan_held[(axis, sign)] = False
 
 
 def trigger_csp_swap():
@@ -3390,25 +3484,34 @@ def on_press(key):
             elif ch == '-':
                 _run_async(adjust_panscan, -PANSCAN_STEP, name="Panscan-")
                 return
+        # Arrow keys: smooth continuous pan via the animator thread. We
+        # send ONE immediate tap-sized delta on the first press (for
+        # instant feedback on quick taps), then mark the direction held
+        # so _pan_animator takes over at PAN_TICK_HZ until release.
+        #
+        # Sign convention: "camera moves left" mental model. Press Left
+        # -> see more of the LEFT source. MPV's video-pan-x positive
+        # shifts the image RIGHT in the cell, which visually reveals
+        # LEFT source content, so arrow-left -> positive video-pan-x.
         if key == Key.left:
-            # "Camera moves left" mental model: press Left -> see more of
-            # the LEFT side of the source. MPV's video-pan-x is "shift the
-            # image within the cell", so positive video-pan-x shifts the
-            # image RIGHT in the cell, which visually reveals LEFT source
-            # content. Arrow-left therefore maps to POSITIVE video-pan-x.
-            _run_async(adjust_video_pan_x, VIDEO_PAN_STEP, name="VPanLeft")
+            if not _pan_held[("x", +1)]:
+                _run_async(adjust_video_pan_x, VIDEO_PAN_STEP, name="VPanLeftTap")
+            _pan_key_down("x", +1)
             return
         if key == Key.right:
-            _run_async(adjust_video_pan_x, -VIDEO_PAN_STEP, name="VPanRight")
+            if not _pan_held[("x", -1)]:
+                _run_async(adjust_video_pan_x, -VIDEO_PAN_STEP, name="VPanRightTap")
+            _pan_key_down("x", -1)
             return
         if key == Key.up:
-            # Same logic vertically: positive video-pan-y shifts the image
-            # DOWN in the cell, revealing TOP source content. Arrow-up
-            # therefore maps to POSITIVE video-pan-y.
-            _run_async(adjust_video_pan_y, VIDEO_PAN_STEP, name="VPanUp")
+            if not _pan_held[("y", +1)]:
+                _run_async(adjust_video_pan_y, VIDEO_PAN_STEP, name="VPanUpTap")
+            _pan_key_down("y", +1)
             return
         if key == Key.down:
-            _run_async(adjust_video_pan_y, -VIDEO_PAN_STEP, name="VPanDown")
+            if not _pan_held[("y", -1)]:
+                _run_async(adjust_video_pan_y, -VIDEO_PAN_STEP, name="VPanDownTap")
+            _pan_key_down("y", -1)
             return
         if key == Key.esc:
             should_quit = True
@@ -3430,8 +3533,22 @@ def on_press(key):
 
 
 def on_release(key):
-    """This function is kept for compatibility but main shutdown logic is in on_press."""
-    pass
+    """Keyboard release handler. Shutdown logic stays in on_press; this
+    handler only clears the held-state flags for the arrow-key smooth-pan
+    animator so the animator thread exits when the user lets go."""
+    try:
+        if key == Key.left:
+            _pan_key_up("x", +1)
+        elif key == Key.right:
+            _pan_key_up("x", -1)
+        elif key == Key.up:
+            _pan_key_up("y", +1)
+        elif key == Key.down:
+            _pan_key_up("y", -1)
+    except Exception as e:
+        # Never propagate from the listener callback — a crash here would
+        # kill the keyboard thread and freeze shutdown.
+        print(f"Error in on_release callback: {e}", flush=True)
 
 
 def main():
