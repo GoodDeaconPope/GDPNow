@@ -907,8 +907,20 @@ class VideoPlayerConfig:
 
 def create_mpv_command(video_file, start_time, geometry, config, socket_index):
     """Creates the MPV command string."""
-    # Base parameters
-    pc_parameters = f"--no-border --video-sync=display-resample --keepaspect --no-keepaspect-window --panscan=1 "
+    # Base parameters.
+    # --input-default-bindings=no + --input-vo-keyboard=no disable ALL of
+    # MPV's built-in keyboard handling. This stops MPV from reacting to
+    # keys that our pynput listener also uses (e.g. + and - triggering
+    # MPV's default panscan bindings, or q quitting a single MPV cell
+    # mid-session). Keyboard control now flows exclusively through the
+    # pynput global listener -> IPC pipe path we already own. Works with
+    # GridHost parent window focus too, because it disables the VO
+    # keyboard input driver entirely regardless of which window has focus.
+    pc_parameters = (
+        f"--no-border --video-sync=display-resample --keepaspect "
+        f"--no-keepaspect-window --panscan=1 "
+        f"--input-default-bindings=no --input-vo-keyboard=no "
+    )
 
     # Only add interpolation if enabled
     if config.use_interpolation:
