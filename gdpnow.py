@@ -1372,6 +1372,19 @@ session_panscan_history = []  # list of (wall_time, value)
 # +/- panscan adjustment step (MPV panscan property range is [0.0, 1.0])
 PANSCAN_STEP = 0.05
 
+# Live session video-pan-x / video-pan-y tracking. MPV's --video-pan-x and
+# --video-pan-y properties pan the rendered video within the cell by a
+# fraction of the output window size, range [-3.0, 3.0]. We only use a
+# small sub-range because values past the visible clipped region just push
+# the video into empty margin (black). adjust_video_pan_x/y() update these
+# and append to history so GRWM can eventually reconstruct pan state.
+session_video_pan_x = 0.0
+session_video_pan_y = 0.0
+session_video_pan_history = []  # list of (wall_time, x, y)
+
+# arrow-key video-pan adjustment step (fraction of output cell width/height)
+VIDEO_PAN_STEP = 0.05
+
 
 def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
     """Record that socket_idx just started playing `filename` from
@@ -1856,6 +1869,69 @@ def adjust_panscan(delta):
     print(f"[panscan] {sign}{delta:.2f} -> {sent} ok, {failed} failed | session_panscan = {session_panscan:.2f}", flush=True)
 
 
+def _adjust_video_pan(axis, delta):
+    """Send an 'add video-pan-<axis> <delta>' command to every active cell
+    via a fresh pipe handle per cell. `axis` must be 'x' or 'y'. MPV clamps
+    the resulting value to [-3.0, 3.0] automatically but we clamp our
+    mirrored tracker to a tighter [-1.0, 1.0] because anything past that
+    pushes the video into empty cell margin (black bars).
+
+    Mirrors adjust_panscan()'s structure: fresh short-lived pipe writes via
+    _send_fresh(), no-osd prefix to suppress flashing overlay text, and
+    updates a module-level session tracker + history list so GRWM can
+    eventually replay time-varying pan state.
+    """
+    global sockets, session_video_pan_x, session_video_pan_y, session_video_pan_history
+    if axis not in ("x", "y"):
+        print(f"[video-pan] invalid axis {axis!r}", flush=True)
+        return
+    if axis == "x":
+        new_value = max(-1.0, min(1.0, session_video_pan_x + delta))
+        session_video_pan_x = new_value
+    else:
+        new_value = max(-1.0, min(1.0, session_video_pan_y + delta))
+        session_video_pan_y = new_value
+    session_video_pan_history.append(
+        (time.time(), session_video_pan_x, session_video_pan_y)
+    )
+    sent = 0
+    failed = 0
+    cmd = f"no-osd add video-pan-{axis} {delta:+.3f}"
+    for i, client in enumerate(sockets):
+        if client is None:
+            continue
+        status = _send_fresh(_pipe_name_for(i), cmd, timeout=5.0, retries=1)
+        if status in ("ok", "retry-ok"):
+            sent += 1
+        else:
+            failed += 1
+            print(f"[video-pan-{axis}] socket {i}: {status}", flush=True)
+    sign = "+" if delta > 0 else ""
+    print(
+        f"[video-pan-{axis}] {sign}{delta:.2f} -> {sent} ok, {failed} failed | "
+        f"session = ({session_video_pan_x:+.2f}, {session_video_pan_y:+.2f})",
+        flush=True,
+    )
+
+
+def adjust_video_pan_x(delta):
+    """Arrow-left/right handler: pan the rendered video horizontally within
+    each cell by `delta` fraction of cell width. Positive = pan right (see
+    more of the LEFT side of the source), negative = pan left (see more of
+    the RIGHT side of the source). Only has visible effect when the video
+    is clipped on the sides, i.e. when fill_scale > fit_scale and panscan is
+    non-zero, which requires the source aspect to differ from the cell
+    aspect (see main()'s landscape crop_width=1.0 override)."""
+    _adjust_video_pan("x", delta)
+
+
+def adjust_video_pan_y(delta):
+    """Arrow-up/down handler: pan the rendered video vertically within each
+    cell by `delta` fraction of cell height. Only visible when the video is
+    clipped top/bottom."""
+    _adjust_video_pan("y", delta)
+
+
 def trigger_csp_swap():
     """E key handler: for every active cell, send a loadfile swapping to
     that video's CSP position (with a small pre-roll), then engage
@@ -2181,6 +2257,21 @@ def generate_grwm_script(session_dir):
     # ---- Panscan strategy summary ----
     panscan_final = max(0.0, min(1.0, float(session_panscan)))
     print(f"[GRWM] Panscan final={panscan_final:.2f}, timeline events={len(panscan_events)}")
+
+    # ---- Video-pan-x/y final values for replay ----
+    # v1: apply FINAL session pan values to every scene (same pattern as the
+    # panscan fallback). Time-varying pan replay would require sub-scene
+    # splitting at video_pan_x/y change points like the panscan path does,
+    # which is a TODO. For now any pan adjustments made during the session
+    # appear as their final-state values across the entire replay.
+    pan_x_final = max(-1.0, min(1.0, float(session_video_pan_x)))
+    pan_y_final = max(-1.0, min(1.0, float(session_video_pan_y)))
+    if pan_x_final != 0.0 or pan_y_final != 0.0:
+        print(f"[GRWM] Video pan final: x={pan_x_final:+.2f}, y={pan_y_final:+.2f} "
+              f"(applied to all scenes; time-varying replay is TODO)")
+    if len(session_video_pan_history) > 1:
+        print(f"[GRWM] WARNING: {len(session_video_pan_history)} pan events recorded "
+              f"but GRWM v1 only replays the FINAL value.")
     if len(panscan_events) > 1:
         # Log each quantized-class change (merge granularity) so the
         # user can see what GRWM actually captured. Continuous panscan
@@ -2266,7 +2357,7 @@ def generate_grwm_script(session_dir):
     # Inspired by PMVCreator's tile/stack pattern but adapted: keep
     # continuous panscan per-scene, use input-side -ss (not trim filter),
     # use NVENC throughout.
-    SCENES = []  # list of (cell_idx, scene_idx, src_path, start, dur, panscan, stem)
+    SCENES = []  # list of (cell_idx, scene_idx, src_path, start, dur, panscan, pan_x, pan_y, stem)
     cell_scene_total = {}  # cell_idx -> sum of scene durations
     for socket_idx in range(grid_size):
         scenes = cell_scenes.get(socket_idx, [])
@@ -2280,6 +2371,8 @@ def generate_grwm_script(session_dir):
                 scene["in_sec"],
                 scene["duration"],
                 scene.get("panscan", panscan_final),
+                scene.get("video_pan_x", pan_x_final),
+                scene.get("video_pan_y", pan_y_final),
                 stem,
             ))
 
@@ -2327,10 +2420,13 @@ def generate_grwm_script(session_dir):
             f.write(f"TOTAL_DURATION = {total_duration:.3f}\n\n")
             f.write("# Per-cell tail pad (seconds) — applied at stage 3 via tpad.\n")
             f.write(f"CELL_TAIL_PAD  = {cell_tail_pad!r}\n\n")
-            f.write("# (cell_idx, scene_idx, src_path, start_sec, dur_sec, panscan, stem)\n")
+            f.write("# (cell_idx, scene_idx, src_path, start_sec, dur_sec, panscan, pan_x, pan_y, stem)\n")
             f.write("SCENES = [\n")
-            for (c, i, src, start, dur, pan, stem) in SCENES:
-                f.write(f"    ({c}, {i}, {src!r}, {start:.3f}, {dur:.3f}, {pan:.3f}, {stem!r}),\n")
+            for (c, i, src, start, dur, pan, px, py, stem) in SCENES:
+                f.write(
+                    f"    ({c}, {i}, {src!r}, {start:.3f}, {dur:.3f}, "
+                    f"{pan:.3f}, {px:.3f}, {py:.3f}, {stem!r}),\n"
+                )
             f.write("]\n\n")
             f.write("ENC_OPTS = [\n")
             f.write("    '-c:v', 'h264_nvenc',\n")
@@ -2359,20 +2455,39 @@ def generate_grwm_script(session_dir):
             f.write("    '-ar', '48000',\n")
             f.write("    '-ac', '2',\n")
             f.write("]\n\n")
-            f.write("def build_scene_filter(panscan, stem):\n")
-            f.write("    '''Build the per-scene vf chain for stage 1.'''\n")
+            f.write("def build_scene_filter(panscan, pan_x, pan_y, stem):\n")
+            f.write("    '''Build the per-scene vf chain for stage 1.\n")
+            f.write("\n")
+            f.write("    pan_x/pan_y are in [-1, 1] (same as live MPV video-pan-x/y) and\n")
+            f.write("    shift the crop position within the padded intermediate by\n")
+            f.write("    pan * CELL dimension. Positive pan_x = image shifts right in the\n")
+            f.write("    cell (equivalent to cropping from a point further LEFT in source).\n")
+            f.write("    The crop x/y exprs are clamped to [0, iw-CELL_W] / [0, ih-CELL_H]\n")
+            f.write("    so pan values that exceed available headroom in fit-mode don't\n")
+            f.write("    trigger an out-of-frame crop error (they just stop panning).\n")
+            f.write("    '''\n")
             f.write("    p = max(0.0, min(1.0, panscan))\n")
+            f.write("    px = max(-1.0, min(1.0, pan_x))\n")
+            f.write("    py = max(-1.0, min(1.0, pan_y))\n")
             f.write("    fit  = f'min({CELL_W}/iw,{CELL_H}/ih)'\n")
             f.write("    fill = f'max({CELL_W}/iw,{CELL_H}/ih)'\n")
             f.write("    factor = f'({fit}+{p:.3f}*({fill}-{fit}))'\n")
             f.write("    crop_pre = f'crop=w=iw*{CW:.4f}:h=ih*{CH:.4f}:y=0,' if (CW < 1.0 or CH < 1.0) else ''\n")
+            f.write("    # Pan offset within the padded intermediate. iw/ih here refer to\n")
+            f.write("    # the POST-pad dimensions (pad ensures iw >= CELL_W and ih >= CELL_H).\n")
+            f.write("    # Default centered crop: x=(iw-CELL_W)/2, y=(ih-CELL_H)/2.\n")
+            f.write("    # Pan shifts it by px*CELL_W (negative x = reveal source LEFT side).\n")
+            f.write("    px_off = -px * CELL_W\n")
+            f.write("    py_off = -py * CELL_H\n")
+            f.write("    x_expr = f'max(0\\\\,min(iw-{CELL_W}\\\\,(iw-{CELL_W})/2+{px_off:+.3f}))'\n")
+            f.write("    y_expr = f'max(0\\\\,min(ih-{CELL_H}\\\\,(ih-{CELL_H})/2+{py_off:+.3f}))'\n")
             f.write("    return (\n")
             f.write("        f\"scale=trunc(ih*dar):ih,setsar=1,\"\n")
             f.write("        f\"{crop_pre}\"\n")
             f.write("        f\"setpts=PTS-STARTPTS,\"\n")
             f.write("        f\"scale=w=-2:h='ih*{factor}',\"\n")
             f.write("        f\"pad=w='max(iw\\\\,{CELL_W})':h='max(ih\\\\,{CELL_H})':x='(ow-iw)/2':y='(oh-ih)/2':color=black,\"\n")
-            f.write("        f\"crop={CELL_W}:{CELL_H}:(iw-{CELL_W})/2:(ih-{CELL_H})/2,\"\n")
+            f.write("        f\"crop={CELL_W}:{CELL_H}:'{x_expr}':'{y_expr}',\"\n")
             f.write("        f\"setsar=1,\"\n")
             f.write("        f\"drawtext=text='{stem}':fontfile='{FONT_PATH}':fontsize={FONT_SIZE}:fontcolor=white@0.7:bordercolor=black@0.55:borderw=2:x={LABEL_PAD}:y={LABEL_PAD}\"\n")
             f.write("    )\n\n")
@@ -2385,9 +2500,9 @@ def generate_grwm_script(session_dir):
             f.write("os.makedirs(TILES_DIR, exist_ok=True)\n")
             f.write("tile_paths = {}  # (cell, idx) -> path\n")
             f.write("total = len(SCENES)\n")
-            f.write("for n, (cell, idx, src, start, dur, panscan, stem) in enumerate(SCENES, 1):\n")
+            f.write("for n, (cell, idx, src, start, dur, panscan, pan_x, pan_y, stem) in enumerate(SCENES, 1):\n")
             f.write("    tile_path = os.path.join(TILES_DIR, f'tile_c{cell}_s{idx:04d}.mp4')\n")
-            f.write("    vf = build_scene_filter(panscan, stem)\n")
+            f.write("    vf = build_scene_filter(panscan, pan_x, pan_y, stem)\n")
             f.write("    cmd = [\n")
             f.write("        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
             f.write("        '-hwaccel', 'cuda',\n")
@@ -2396,7 +2511,7 @@ def generate_grwm_script(session_dir):
             f.write("        '-i', src,\n")
             f.write("        '-vf', vf,\n")
             f.write("    ] + ENC_OPTS + [tile_path]\n")
-            f.write("    print(f'[Stage1 {n}/{total}] cell={cell} scene={idx} dur={dur:.2f}s panscan={panscan:.2f}')\n")
+            f.write("    print(f'[Stage1 {n}/{total}] cell={cell} scene={idx} dur={dur:.2f}s panscan={panscan:.2f} pan=({pan_x:+.2f},{pan_y:+.2f})')\n")
             f.write("    run_cmd(f'Stage1 cell{cell} scene{idx}', cmd)\n")
             f.write("    tile_paths[(cell, idx)] = tile_path\n\n")
             f.write("# ========== Stage 2: Per-cell concat demuxer (stream copy) ==========\n")
@@ -3249,13 +3364,15 @@ def on_press(key):
     """Keyboard listener callback for key presses.
 
     Keybinds:
-      q / ESC  - immediate shutdown (synchronous)
-      e        - CSP swap across all cells + lock cycling (async)
-      + / =    - increase panscan (async)
-      -        - decrease panscan (async)
+      q / ESC       - immediate shutdown (synchronous)
+      e             - CSP swap across all cells + lock cycling (async)
+      + / =         - increase panscan (async)
+      -             - decrease panscan (async)
+      left / right  - pan video horizontally within each cell (async)
+      up / down     - pan video vertically within each cell (async)
 
-    E / +/- are dispatched to background daemon threads so a blocking
-    IPC write never freezes the listener and Q/ESC stay responsive.
+    E / +/- / arrows are dispatched to background daemon threads so a
+    blocking IPC write never freezes the listener and Q/ESC stay responsive.
     """
     should_quit = False
     try:
@@ -3273,6 +3390,26 @@ def on_press(key):
             elif ch == '-':
                 _run_async(adjust_panscan, -PANSCAN_STEP, name="Panscan-")
                 return
+        if key == Key.left:
+            # "Camera moves left" mental model: press Left -> see more of
+            # the LEFT side of the source. MPV's video-pan-x is "shift the
+            # image within the cell", so positive video-pan-x shifts the
+            # image RIGHT in the cell, which visually reveals LEFT source
+            # content. Arrow-left therefore maps to POSITIVE video-pan-x.
+            _run_async(adjust_video_pan_x, VIDEO_PAN_STEP, name="VPanLeft")
+            return
+        if key == Key.right:
+            _run_async(adjust_video_pan_x, -VIDEO_PAN_STEP, name="VPanRight")
+            return
+        if key == Key.up:
+            # Same logic vertically: positive video-pan-y shifts the image
+            # DOWN in the cell, revealing TOP source content. Arrow-up
+            # therefore maps to POSITIVE video-pan-y.
+            _run_async(adjust_video_pan_y, VIDEO_PAN_STEP, name="VPanUp")
+            return
+        if key == Key.down:
+            _run_async(adjust_video_pan_y, -VIDEO_PAN_STEP, name="VPanDown")
+            return
         if key == Key.esc:
             should_quit = True
 
@@ -3462,6 +3599,20 @@ def main():
         except Exception as e:
             print(f"Error during crop_width calculation: {e}. Using default.")
             calculated_value = 0.8
+
+        # Landscape-grid override: the pre-fit formula above shrinks source width
+        # so post-crop aspect matches cell aspect, which collapses panscan range
+        # to zero on 2x1 (and generally destroys up to ~56% of width). For
+        # landscape grids we keep the full source width (calc_w=1.0) and rely on
+        # the new arrow-key video-pan-x / video-pan-y bindings to scroll through
+        # the oversized frame. Portrait grids already clamped to 1.0 naturally.
+        if row_grid > 0 and column_grid > 0 and row_grid < column_grid:
+            print(
+                f"Landscape grid {column_grid}x{row_grid}: overriding "
+                f"calculated crop_width {calculated_value:.4f} -> 1.0 "
+                f"(use arrow keys to pan the camera within each cell)."
+            )
+            calculated_value = 1.0
 
         # Set final crop_width based on master_type, using calculated value as fallback/default for most
         config.crop_width = {
