@@ -1135,14 +1135,28 @@ person_socket_map = {} # Dictionary mapping socket index to list of assigned vid
 
 
 class SmartProxyManager:
-    def __init__(self, max_workers=8):
-        # Stream-copy workers are mostly IO-bound, so bumping from 4->8 cuts
-        # queue latency for large grids without meaningful CPU cost.
+    # NVMe SSD cache directory. Sources live on a USB HDD (E:\) which is the
+    # real bottleneck — we stage proxies on the fast internal SSD so playback
+    # and per-switch reads don't fight the HDD head.
+    DEFAULT_OUTPUT_DIR = r"%USERPROFILE%\.gdpnow_proxies"
+
+    def __init__(self, max_workers=2, output_dir=None):
+        # max_workers=2 on purpose. Sources live on USB HDD; more concurrent
+        # readers cause head thrashing that collapses sequential throughput.
+        # Two workers gives a modest pipeline without head-contention blowup.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         self.futures = {}
         self.lock = threading.Lock()
         self.running = True
         self.ffmpeg_pids = set()  # Track PIDs for shutdown
+
+        self.output_dir = output_dir or self.DEFAULT_OUTPUT_DIR
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except OSError as e:
+            print(f"[JIT WARN] Could not create proxy dir '{self.output_dir}': {e}")
+            print(f"[JIT WARN] Falling back to source-adjacent segments.")
+            self.output_dir = None
 
     def shutdown(self):
         self.running = False
@@ -1151,9 +1165,17 @@ class SmartProxyManager:
 
     def _seg_paths(self, original_path, start_time, duration):
         original_path = os.path.abspath(original_path)
-        base, ext = os.path.splitext(original_path)
-        seg_name = f"{base}_seg_{int(start_time)}_{int(duration)}_copy.mp4"
-        temp_name = f"{base}_seg_{int(start_time)}_{int(duration)}_temp.mp4"
+        if self.output_dir:
+            # Stage on SSD, keyed by source basename (sources live in one dir
+            # so basename is a unique identifier in this setup).
+            base = os.path.splitext(os.path.basename(original_path))[0]
+            seg_name = os.path.join(self.output_dir, f"{base}_seg_{int(start_time)}_{int(duration)}_copy.mp4")
+            temp_name = os.path.join(self.output_dir, f"{base}_seg_{int(start_time)}_{int(duration)}_temp.mp4")
+        else:
+            # Fallback: write next to the source on whatever disk it lives on.
+            base, _ext = os.path.splitext(original_path)
+            seg_name = f"{base}_seg_{int(start_time)}_{int(duration)}_copy.mp4"
+            temp_name = f"{base}_seg_{int(start_time)}_{int(duration)}_temp.mp4"
         return seg_name, temp_name
 
     def get_segment_path(self, original_path, start_time, duration):
@@ -1784,25 +1806,11 @@ def main():
             "PM": 1.0 
         }.get(master_type, calc_w)
 
-        # --- NEW: DYNAMIC PROXY CALCULATION ---
-        # 1. Determine ideal proxy height based on grid rows
-        if row_grid > 0:
-            raw_height = input_geometry[1] / row_grid
-        else:
-            raw_height = 540
+        # Proxy manager is already instantiated at module scope as
+        # SmartProxyManager() with SSD cache dir and max_workers=2.
+        # Stream-copy proxies don't scale, so no need to compute a target
+        # height per grid config. Leave the module-level instance in place.
 
-        # 2. Round to nearest even integer
-        target_proxy_height = int(raw_height)
-        if target_proxy_height % 2 != 0: target_proxy_height += 1
-        
-        # 3. Clamp (144p min, 1080p max)
-        target_proxy_height = max(144, min(target_proxy_height, 1080))
-        
-        print(f"\n[Config] Grid is {column_grid}x{row_grid}. Dynamic Proxy Target: {target_proxy_height}p")
-        
-        # 4. Initialize the Global Manager
-# Initialize the SEGMENT Manager (renamed to SmartProxyManager)
-        proxy_manager = SmartProxyManager(output_height=target_proxy_height, max_workers=4)
         # --- Start ---
         video_list = prepare_video_list()
         if video_list and grid_size > 0:
