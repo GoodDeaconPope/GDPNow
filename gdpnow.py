@@ -11,9 +11,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Reconfigure stdout/stderr to UTF-8 so prints containing non-ASCII chars
 # (e.g. U+A789 "꞉" in session IDs) don't crash on legacy cp1252 consoles.
+# line_buffering=True forces a flush on every '\n' — critical when running
+# under PowerShell, which presents stdout as a block-buffered pipe rather
+# than a terminal. Without this, prints from background threads (CSP swap,
+# panscan, NutCounter) can sit in the buffer for tens of seconds before
+# becoming visible, giving the false impression that the session hung.
 try:
-    _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    _sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    _sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 except Exception:
     pass
 from PIL import ImageGrab
@@ -1583,12 +1588,17 @@ def adjust_panscan(delta):
 def trigger_csp_swap():
     """E key handler: for every active cell, send a loadfile swapping to
     that video's CSP position (with a small pre-roll), then engage
-    e_locked so the cycle thread stops further switching."""
+    e_locked so the cycle thread stops further switching.
+
+    Runs on a background daemon thread spawned by on_press so a blocking
+    IPC send can never freeze the keyboard listener. Explicit flush=True
+    on every print so hangs are visible immediately in real-time."""
     global sockets
-    print("\n[E] CSP SWAP TRIGGERED ============================")
+    print("\n[E] CSP SWAP TRIGGERED ============================", flush=True)
     snap = _snapshot_cell_state()
+    print(f"[E] snapshot has {len(snap)} cells", flush=True)
     if not snap:
-        print("[E] No cell state — nothing to swap.")
+        print("[E] No cell state — nothing to swap.", flush=True)
         return
     swapped = 0
     skipped = 0
@@ -1597,19 +1607,19 @@ def trigger_csp_swap():
         if socket_idx >= len(sockets) or sockets[socket_idx] is None:
             print(f"  Socket {socket_idx}: no live socket, skipping.")
             skipped += 1
-            continue
+            continue  # flush ensured by preceding print
         meta = info.get("metadata") or {}
         csp_str = meta.get("CSP")
         if not csp_str:
             print(f"  Socket {socket_idx}: no CSP in metadata for {info['filename']}, skipping.")
             skipped += 1
-            continue
+            continue  # flush ensured by preceding print
         try:
             csp_sec = mmss_to_seconds(csp_str)
         except Exception:
             print(f"  Socket {socket_idx}: bad CSP value {csp_str!r}, skipping.")
             skipped += 1
-            continue
+            continue  # flush ensured by preceding print
         # Pre-roll: back up a couple seconds so the climax has lead-in.
         start_sec = max(0, csp_sec - CSP_PRE_ROLL_SEC)
         start_str = seconds_to_mmss(start_sec)
@@ -2631,14 +2641,30 @@ def force_shutdown_and_exit():
     os._exit(0)
 
 
+def _run_async(target, *args, name="KeyAction"):
+    """Spawn a daemon thread to run target(*args). Used to keep the pynput
+    listener thread from blocking on IPC sends — if send() hangs because
+    MPV isn't consuming its pipe, the listener stays responsive to Q/ESC."""
+    def _wrap():
+        try:
+            target(*args)
+        except Exception as e:
+            print(f"[{name}] error: {e}")
+    t = threading.Thread(target=_wrap, daemon=True, name=name)
+    t.start()
+
+
 def on_press(key):
     """Keyboard listener callback for key presses.
 
     Keybinds:
-      q / ESC  - immediate shutdown
-      e        - CSP swap across all cells + lock cycling
-      + / =    - increase panscan (zoom/crop tighter)
-      -        - decrease panscan (zoom out)
+      q / ESC  - immediate shutdown (synchronous)
+      e        - CSP swap across all cells + lock cycling (async)
+      + / =    - increase panscan (async)
+      -        - decrease panscan (async)
+
+    E / +/- are dispatched to background daemon threads so a blocking
+    IPC write never freezes the listener and Q/ESC stay responsive.
     """
     should_quit = False
     try:
@@ -2648,22 +2674,13 @@ def on_press(key):
             if low == 'q':
                 should_quit = True
             elif low == 'e':
-                try:
-                    trigger_csp_swap()
-                except Exception as e:
-                    print(f"[E key] trigger_csp_swap error: {e}")
-                return  # don't quit
+                _run_async(trigger_csp_swap, name="CSPSwap")
+                return
             elif ch in ('+', '='):
-                try:
-                    adjust_panscan(PANSCAN_STEP)
-                except Exception as e:
-                    print(f"[panscan +] error: {e}")
+                _run_async(adjust_panscan, PANSCAN_STEP, name="Panscan+")
                 return
             elif ch == '-':
-                try:
-                    adjust_panscan(-PANSCAN_STEP)
-                except Exception as e:
-                    print(f"[panscan -] error: {e}")
+                _run_async(adjust_panscan, -PANSCAN_STEP, name="Panscan-")
                 return
         if key == Key.esc:
             should_quit = True
