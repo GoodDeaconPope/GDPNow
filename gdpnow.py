@@ -7,7 +7,7 @@ import tempfile
 import time
 import math
 import random
-from PIL import ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 # Reconfigure stdout/stderr to UTF-8 so prints containing non-ASCII chars
 # (e.g. U+A789 "꞉" in session IDs) don't crash on legacy cp1252 consoles.
@@ -1170,29 +1170,52 @@ person_socket_map = {} # Dictionary mapping socket index to list of assigned vid
 
 # Per-cell playback state, used by NutCounter to label screenshots.
 # Keyed by socket index (which maps to grid cell position).
-# Each entry: {"filename": str, "started_wall": float, "started_pos_sec": float}
-# started_wall = time.time() when the cell loaded this video
-# started_pos_sec = offset in seconds into the source file where playback began
+# Each entry: {"filename": str, "started_wall": float, "started_pos_sec": float,
+#              "metadata": dict}
 cell_state = {}
 cell_state_lock = threading.Lock()
 
+# Full session history: every (wall_time, socket_idx, filename, pos_sec, metadata)
+# tuple, appended in order. Used by GRWM script generator to reconstruct what
+# was watched.
+cell_history = []
 
-def _update_cell_state(socket_idx, filename, started_pos_sec):
+# Set when E key is pressed; cycle thread checks this and stops switching.
+e_locked = threading.Event()
+
+
+def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
     """Record that socket_idx just started playing `filename` from
-    `started_pos_sec` seconds into the source. NutCounter reads this to
-    overlay labels on screenshots."""
+    `started_pos_sec` seconds into the source. Updates the live cell_state
+    snapshot (used by NutCounter for label overlay) AND appends to the
+    session history (used by GRWM for scene reconstruction)."""
+    entry_metadata = dict(metadata) if metadata else {}
+    now = time.time()
     with cell_state_lock:
         cell_state[socket_idx] = {
             "filename": filename,
-            "started_wall": time.time(),
+            "started_wall": now,
             "started_pos_sec": float(started_pos_sec),
+            "metadata": entry_metadata,
         }
+        cell_history.append({
+            "wall": now,
+            "socket_idx": socket_idx,
+            "filename": filename,
+            "pos_sec": float(started_pos_sec),
+            "metadata": entry_metadata,
+        })
 
 
 def _snapshot_cell_state():
     """Return a shallow copy of cell_state for consumers that iterate it."""
     with cell_state_lock:
         return dict(cell_state)
+
+
+def _snapshot_cell_history():
+    with cell_state_lock:
+        return list(cell_history)
 
 
 class NutCounter:
@@ -1302,20 +1325,30 @@ class NutCounter:
 
     def _annotate(self, img):
         """Overlay per-cell file number + timestamp labels onto the captured
-        image. Reads the global cell_state snapshot at call time."""
+        image. Reads the global cell_state snapshot at call time. Renders
+        the text onto a transparent RGBA overlay and alpha-composites it
+        onto the captured image so the labels look subtle instead of
+        dominating the frame."""
         try:
             state = _snapshot_cell_state()
             if not state:
                 return img
-            draw = ImageDraw.Draw(img)
+            # Ensure RGBA so we can alpha-composite the label overlay.
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
             w, h = img.size
             cell_w = w / self.column_grid
             cell_h = h / self.row_grid
-            # Font size scales with cell height; clamp to sensible range.
-            font_size = max(14, min(36, int(cell_h * 0.06)))
+            # "Subtle" sizing: smaller font, tighter padding.
+            font_size = max(10, min(24, int(cell_h * 0.04)))
             font = self._get_font(font_size)
             now = time.time()
-            pad = max(6, font_size // 3)
+            pad = max(4, font_size // 3)
+            # Semi-transparent colors — readable but not dominating.
+            TEXT_RGBA = (255, 255, 255, 180)
+            STROKE_RGBA = (0, 0, 0, 140)
             for socket_idx, info in state.items():
                 col = socket_idx % self.column_grid
                 row = socket_idx // self.column_grid
@@ -1334,16 +1367,17 @@ class NutCounter:
                     draw.text(
                         (x, y),
                         label,
-                        fill="white",
+                        fill=TEXT_RGBA,
                         font=font,
-                        stroke_width=2,
-                        stroke_fill="black",
+                        stroke_width=1,
+                        stroke_fill=STROKE_RGBA,
                     )
                 except TypeError:
                     # Pillow < 8.0 doesn't support stroke_*; fake it with 4-way shadow.
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        draw.text((x + dx, y + dy), label, fill="black", font=font)
-                    draw.text((x, y), label, fill="white", font=font)
+                        draw.text((x + dx, y + dy), label, fill=STROKE_RGBA, font=font)
+                    draw.text((x, y), label, fill=TEXT_RGBA, font=font)
+            img = Image.alpha_composite(img, overlay)
         except Exception as e:
             print(f"[NutCounter] Annotate error: {e}")
         return img
@@ -1480,6 +1514,298 @@ class NutCounter:
 nut_counter = NutCounter()
 
 
+# ============================================================
+# E key / CSP swap + GRWM script generator
+# ============================================================
+
+_SOURCE_ROOT_DEFAULT = r"E:\1SystemFile"
+
+
+def _resolve_source_path(filename):
+    """Resolve a bare filename (e.g. '321.mp4') to an absolute path under
+    the source directory. Returns the original if it's already absolute."""
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(_SOURCE_ROOT_DEFAULT, filename)
+
+
+CSP_PRE_ROLL_SEC = 2  # start playback this many seconds before the CSP marker
+
+
+def trigger_csp_swap():
+    """E key handler: for every active cell, send a loadfile swapping to
+    that video's CSP position (with a small pre-roll), then engage
+    e_locked so the cycle thread stops further switching."""
+    global sockets
+    print("\n[E] CSP SWAP TRIGGERED ============================")
+    snap = _snapshot_cell_state()
+    if not snap:
+        print("[E] No cell state — nothing to swap.")
+        return
+    swapped = 0
+    skipped = 0
+    for socket_idx in sorted(snap.keys()):
+        info = snap[socket_idx]
+        if socket_idx >= len(sockets) or sockets[socket_idx] is None:
+            print(f"  Socket {socket_idx}: no live socket, skipping.")
+            skipped += 1
+            continue
+        meta = info.get("metadata") or {}
+        csp_str = meta.get("CSP")
+        if not csp_str:
+            print(f"  Socket {socket_idx}: no CSP in metadata for {info['filename']}, skipping.")
+            skipped += 1
+            continue
+        try:
+            csp_sec = mmss_to_seconds(csp_str)
+        except Exception:
+            print(f"  Socket {socket_idx}: bad CSP value {csp_str!r}, skipping.")
+            skipped += 1
+            continue
+        # Pre-roll: back up a couple seconds so the climax has lead-in.
+        start_sec = max(0, csp_sec - CSP_PRE_ROLL_SEC)
+        start_str = seconds_to_mmss(start_sec)
+        filename = info["filename"]
+        cmd = f'loadfile {filename} replace "start={start_str}"'
+        try:
+            sockets[socket_idx].send(cmd)
+            _update_cell_state(socket_idx, filename, start_sec, meta)
+            print(f"  Socket {socket_idx}: {filename} -> CSP @ {csp_str} (start {start_str}, -{CSP_PRE_ROLL_SEC}s)")
+            swapped += 1
+        except Exception as e:
+            print(f"  Socket {socket_idx}: send failed: {e}")
+            skipped += 1
+    e_locked.set()
+    print(f"[E] Swapped {swapped}, skipped {skipped}. Cycling locked on CSP.")
+    print("[E] Press Q or ESC to finalize the session.")
+
+
+def generate_grwm_script(session_dir):
+    """Write GRWM grid-replay artifacts to session_dir.
+
+    Recreates the actual grid the user was watching: each cell shows the
+    same scenes at the same times, scaled to a 1920x1080 output, and
+    xstacked into the same column×row grid layout the live session used.
+
+    Outputs:
+      grwm_filter.txt    — ffmpeg -filter_complex_script body
+      run_grwm.py        — Python runner that builds the ffmpeg arg list
+                            (sidesteps Windows cmd 8191-char limit)
+      run_grwm.bat       — thin wrapper: 'python run_grwm.py'
+      grwm_sequential.ffconcat — fallback simple-stitch concat file
+
+    User runs run_grwm.bat (or run_grwm.py directly) to produce grwm.mp4.
+    """
+    if not session_dir:
+        print("[GRWM] No session dir, skipping.")
+        return
+    history = _snapshot_cell_history()
+    if not history:
+        print("[GRWM] No history, skipping.")
+        return
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[GRWM] Could not ensure session dir: {e}")
+        return
+
+    # ---- Resolve grid dimensions ----
+    cg = max(1, int(getattr(nut_counter, "column_grid", 1)))
+    rg = max(1, int(getattr(nut_counter, "row_grid", 1)))
+    grid_size = cg * rg
+
+    # ---- Time anchors ----
+    session_start = min(e["wall"] for e in history)
+    session_end = time.time()
+    total_duration = max(1.0, session_end - session_start)
+
+    # ---- Group history by cell, compute per-scene durations ----
+    by_socket = {}
+    for entry in history:
+        by_socket.setdefault(entry["socket_idx"], []).append(entry)
+
+    cell_scenes = {}
+    for socket_idx in range(grid_size):
+        entries = by_socket.get(socket_idx, [])
+        entries.sort(key=lambda e: e["wall"])
+        scenes = []
+        for i, e in enumerate(entries):
+            if i + 1 < len(entries):
+                duration = entries[i + 1]["wall"] - e["wall"]
+            else:
+                duration = session_end - e["wall"]
+            duration = max(0.5, duration)
+            scenes.append({
+                "filename": e["filename"],
+                "in_sec": e["pos_sec"],
+                "duration": duration,
+            })
+        cell_scenes[socket_idx] = scenes
+
+    # ---- Output dimensions ----
+    out_w, out_h = 1920, 1080
+    cell_w = (out_w // cg) - ((out_w // cg) % 2)  # even
+    cell_h = (out_h // rg) - ((out_h // rg) % 2)  # even
+
+    # ---- Build inputs list and filter graph ----
+    inputs = []          # absolute paths, one -i per scene
+    filter_lines = []
+    cell_stream_labels = []  # in grid order
+
+    input_idx = 0
+    for socket_idx in range(grid_size):
+        scenes = cell_scenes[socket_idx]
+        if not scenes:
+            # No history for this cell — emit a black source for the full
+            # session duration so the grid layout still works.
+            label = f"[cell{socket_idx}]"
+            filter_lines.append(
+                f"color=c=black:s={cell_w}x{cell_h}:d={total_duration:.3f}{label}"
+            )
+            cell_stream_labels.append(label)
+            continue
+
+        per_scene_labels = []
+        for scene in scenes:
+            inputs.append(_resolve_source_path(scene["filename"]))
+            in_lbl = f"[{input_idx}:v]"
+            scene_lbl = f"[s{input_idx}]"
+            filter_lines.append(
+                f"{in_lbl}trim=start={scene['in_sec']:.3f}:duration={scene['duration']:.3f},"
+                f"setpts=PTS-STARTPTS,"
+                f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
+                f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                f"{scene_lbl}"
+            )
+            per_scene_labels.append(scene_lbl)
+            input_idx += 1
+
+        cell_lbl = f"[cell{socket_idx}]"
+        if len(per_scene_labels) == 1:
+            # Avoid degenerate concat=n=1; rename the single scene's label.
+            old = per_scene_labels[0]
+            filter_lines[-1] = filter_lines[-1].replace(old, cell_lbl)
+        else:
+            concat_in = "".join(per_scene_labels)
+            filter_lines.append(
+                f"{concat_in}concat=n={len(per_scene_labels)}:v=1:a=0{cell_lbl}"
+            )
+        cell_stream_labels.append(cell_lbl)
+
+    # ---- xstack the cells into a grid ----
+    if grid_size == 1:
+        # Single cell — no xstack needed, rename to [out]
+        filter_lines[-1] = filter_lines[-1].replace("[cell0]", "[out]")
+    else:
+        layout_parts = []
+        for i in range(grid_size):
+            col = i % cg
+            row = i // cg
+            layout_parts.append(f"{col * cell_w}_{row * cell_h}")
+        xstack_in = "".join(cell_stream_labels)
+        filter_lines.append(
+            f"{xstack_in}xstack=inputs={grid_size}:layout={'|'.join(layout_parts)}:fill=black[out]"
+        )
+
+    # ---- Write filter script ----
+    filter_script_path = os.path.join(session_dir, "grwm_filter.txt")
+    try:
+        with open(filter_script_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(";\n".join(filter_lines))
+            f.write("\n")
+    except OSError as e:
+        print(f"[GRWM] Failed to write filter script: {e}")
+        return
+
+    # ---- Write Python runner (sidesteps cmd 8191-char limit) ----
+    runner_path = os.path.join(session_dir, "run_grwm.py")
+    output_video = os.path.join(session_dir, "grwm.mp4")
+    try:
+        with open(runner_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# GRWM grid replay runner\n")
+            f.write(f"# Session: {os.path.basename(session_dir)}\n")
+            f.write(f"# Grid: {cg}x{rg}, {len(inputs)} scenes, {total_duration:.1f}s total\n")
+            f.write("# NVENC H264 high quality (preset p7, cq 18)\n")
+            f.write("import subprocess, sys\n\n")
+            f.write("INPUTS = [\n")
+            for inp in inputs:
+                f.write(f"    {inp!r},\n")
+            f.write("]\n\n")
+            f.write(f"FILTER_SCRIPT = {filter_script_path!r}\n")
+            f.write(f"OUTPUT = {output_video!r}\n\n")
+            f.write("cmd = ['ffmpeg', '-y', '-hide_banner']\n")
+            f.write("for p in INPUTS:\n")
+            f.write("    cmd += ['-i', p]\n")
+            f.write("cmd += [\n")
+            f.write("    '-filter_complex_script', FILTER_SCRIPT,\n")
+            f.write("    '-map', '[out]',\n")
+            f.write("    '-c:v', 'h264_nvenc',\n")
+            f.write("    '-preset', 'p7',\n")
+            f.write("    '-tune', 'hq',\n")
+            f.write("    '-rc', 'vbr',\n")
+            f.write("    '-cq', '18',\n")
+            f.write("    '-b:v', '20M',\n")
+            f.write("    '-maxrate', '40M',\n")
+            f.write("    '-bufsize', '60M',\n")
+            f.write("    '-pix_fmt', 'yuv420p',\n")
+            f.write("    '-profile:v', 'high',\n")
+            f.write("    '-level', '4.2',\n")
+            f.write("    '-an',\n")  # no audio (grid mode)
+            f.write("    OUTPUT,\n")
+            f.write("]\n")
+            f.write("print(f'Running ffmpeg with {len(INPUTS)} inputs...')\n")
+            f.write("sys.exit(subprocess.run(cmd).returncode)\n")
+    except OSError as e:
+        print(f"[GRWM] Failed to write runner: {e}")
+        return
+
+    # ---- Write thin .bat wrapper for double-click convenience ----
+    bat_path = os.path.join(session_dir, "run_grwm.bat")
+    try:
+        with open(bat_path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("@echo off\r\n")
+            f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(inputs)} scenes\r\n")
+            f.write(f"cd /d \"{session_dir}\"\r\n")
+            f.write("python run_grwm.py\r\n")
+            f.write("pause\r\n")
+    except OSError as e:
+        print(f"[GRWM] Failed to write bat: {e}")
+
+    # ---- Also write a sequential fallback ffconcat ----
+    seq_concat_path = os.path.join(session_dir, "grwm_sequential.ffconcat")
+    try:
+        flat_scenes = []
+        for socket_idx, scenes in cell_scenes.items():
+            for s in scenes:
+                flat_scenes.append((socket_idx, s))
+        # Sort by the wall time of the original entry
+        flat_scenes_with_wall = []
+        for socket_idx, s in flat_scenes:
+            for e in by_socket.get(socket_idx, []):
+                if e["filename"] == s["filename"] and abs(e["pos_sec"] - s["in_sec"]) < 0.01:
+                    flat_scenes_with_wall.append((e["wall"], socket_idx, s))
+                    break
+        flat_scenes_with_wall.sort(key=lambda x: x[0])
+        with open(seq_concat_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("ffconcat version 1.0\n")
+            f.write(f"# GRWM sequential fallback - {len(flat_scenes_with_wall)} scenes\n")
+            f.write("# Use this if grid replay (run_grwm.bat) is failing.\n")
+            for idx, (wall, socket_idx, s) in enumerate(flat_scenes_with_wall):
+                src = _resolve_source_path(s["filename"]).replace("\\", "/")
+                f.write(f"# scene {idx+1}: socket {socket_idx} -> {s['filename']} "
+                        f"@ {s['in_sec']:.1f}s for {s['duration']:.1f}s\n")
+                f.write(f"file '{src}'\n")
+                f.write(f"inpoint {s['in_sec']:.3f}\n")
+                f.write(f"outpoint {s['in_sec'] + s['duration']:.3f}\n")
+    except OSError as e:
+        print(f"[GRWM] Failed to write sequential fallback: {e}")
+
+    print(f"[GRWM] Grid replay: {cg}x{rg} grid, {len(inputs)} scenes, {total_duration:.1f}s")
+    print(f"[GRWM]   Filter: {filter_script_path}")
+    print(f"[GRWM]   Runner: {bat_path} (or run_grwm.py)")
+    print(f"[GRWM]   Sequential fallback: {seq_concat_path}")
+
+
 def play_videos(config, video_list):
     """Starts MPV instances based on config and video list, prepares for cycling."""
     global sockets, processes, person_socket_map, interrupt_event
@@ -1591,8 +1917,10 @@ def play_videos(config, video_list):
                     metadata["videoTime"] = config.default_duration_map.get(config.master_type, 60)
 
         command_list = create_mpv_command(first_filename, first_start_time_str, geometry, config, i)
-        # Record what this cell is showing for NutCounter label overlay.
-        _update_cell_state(i, first_filename, mmss_to_seconds(first_start_time_str))
+        # Record what this cell is showing for NutCounter label overlay
+        # and GRWM scene history. Pass full metadata so E-key CSP swap
+        # can find the CSP time for this video later.
+        _update_cell_state(i, first_filename, mmss_to_seconds(first_start_time_str), first_metadata)
         process = None
         if config.production and command_list:
             print(f"    Starting MPV for: {first_filename}")
@@ -1967,6 +2295,11 @@ def cycle_videos(config):
         wall_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"--- Cycle Switch {switch_idx}/{num_switches} at ~{wall_ts} ---")
 
+        # E key was pressed — hold everyone on CSP, skip this switch.
+        if e_locked.is_set():
+            print(f"Cycle Thread: e_locked engaged, holding on CSP (switch {switch_idx} skipped).")
+            continue
+
         for socket_idx in active_socket_indices:
             if socket_idx in dead_sockets:
                 continue
@@ -2010,8 +2343,17 @@ def cycle_videos(config):
 
             cmd = f'loadfile {v["filename"]} replace "start={final_start_str}"'
             send_command_to_socket_index(socket_idx, cmd)
-            # Record new state for NutCounter label overlay.
-            _update_cell_state(socket_idx, v["filename"], mmss_to_seconds(final_start_str))
+            # Record new state for NutCounter + GRWM. Pull full metadata
+            # from person_socket_map (v dict only has filename/base_sec).
+            scene_metadata = None
+            try:
+                for entry in person_socket_map.get(socket_idx, []):
+                    if v["filename"] in entry:
+                        scene_metadata = entry[v["filename"]]
+                        break
+            except Exception:
+                pass
+            _update_cell_state(socket_idx, v["filename"], mmss_to_seconds(final_start_str), scene_metadata)
 
         # 🔥 If everything is dead, just bail out
         if len(dead_sockets) == len(active_socket_indices):
@@ -2044,6 +2386,12 @@ def cleanup_resources():
         nut_counter.finalize()
     except Exception as e:
         print(f"[NutCounter] Finalize failed in cleanup: {e}")
+
+    # Generate GRWM script (concat file + bat runner) alongside screenshots.
+    try:
+        generate_grwm_script(nut_counter.final_dir)
+    except Exception as e:
+        print(f"[GRWM] Generate failed in cleanup: {e}")
 
     # --- Close IPC clients ---
     print(f"Closing {len(sockets)} socket handles...")
@@ -2108,6 +2456,12 @@ def force_shutdown_and_exit():
     except Exception as e:
         print(f"[NutCounter] Finalize failed in force_shutdown: {e}")
 
+    # Generate GRWM script (concat file + bat runner) alongside screenshots.
+    try:
+        generate_grwm_script(nut_counter.final_dir)
+    except Exception as e:
+        print(f"[GRWM] Generate failed in force_shutdown: {e}")
+
     # Create a copy of the list to kill from, to avoid modification issues
     procs_to_kill = list(processes)
     
@@ -2129,19 +2483,29 @@ def force_shutdown_and_exit():
 
 
 def on_press(key):
-    """Keyboard listener callback for key presses. 'q' or ESC triggers immediate shutdown."""
+    """Keyboard listener callback for key presses. 'q' or ESC triggers
+    immediate shutdown. 'e' triggers a CSP swap across all cells and
+    locks cycling."""
     should_quit = False
     try:
-        if hasattr(key, 'char') and key.char == 'q':
-            should_quit = True
-        elif key == Key.esc:
+        if hasattr(key, 'char') and key.char:
+            ch = key.char.lower()
+            if ch == 'q':
+                should_quit = True
+            elif ch == 'e':
+                try:
+                    trigger_csp_swap()
+                except Exception as e:
+                    print(f"[E key] trigger_csp_swap error: {e}")
+                return  # don't quit
+        if key == Key.esc:
             should_quit = True
 
         if should_quit:
             # Don't do any complex logic here. Just call the emergency shutdown.
             # This function will terminate the entire program.
             force_shutdown_and_exit()
-            
+
             # This part will likely not be reached, but it's good practice
             # to stop the listener if the program were to somehow continue.
             return False
