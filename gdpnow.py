@@ -1183,6 +1183,14 @@ cell_history = []
 # Set when E key is pressed; cycle thread checks this and stops switching.
 e_locked = threading.Event()
 
+# Snapshot of the live crop factors, captured at play_videos() start so
+# GRWM can match what was actually on screen during the session.
+session_crop_width = None
+session_crop_height = None
+
+# +/- panscan adjustment step (MPV panscan property range is [0.0, 1.0])
+PANSCAN_STEP = 0.05
+
 
 def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
     """Record that socket_idx just started playing `filename` from
@@ -1540,6 +1548,23 @@ def _resolve_source_path(filename):
 CSP_PRE_ROLL_SEC = 2  # start playback this many seconds before the CSP marker
 
 
+def adjust_panscan(delta):
+    """Send an 'add panscan <delta>' command to every active cell.
+    MPV clamps the resulting value to [0.0, 1.0] automatically."""
+    global sockets
+    sent = 0
+    for i, client in enumerate(sockets):
+        if client is None:
+            continue
+        try:
+            client.send(f"add panscan {delta:+.3f}")
+            sent += 1
+        except Exception as e:
+            print(f"[panscan] socket {i} failed: {e}")
+    sign = "+" if delta > 0 else ""
+    print(f"[panscan] {sign}{delta:.2f} sent to {sent} cells")
+
+
 def trigger_csp_swap():
     """E key handler: for every active cell, send a loadfile swapping to
     that video's CSP position (with a small pre-roll), then engage
@@ -1655,6 +1680,23 @@ def generate_grwm_script(session_dir):
     cell_w = (out_w // cg) - ((out_w // cg) % 2)  # even
     cell_h = (out_h // rg) - ((out_h // rg) % 2)  # even
 
+    # ---- Crop factors matching the live session ----
+    # play_videos snapshots config.crop_width/crop_height into these globals
+    # at session start. Applies the same top-aligned crop the live MPV was
+    # showing (y=0, horizontally centered) so GRWM matches what the user
+    # actually watched.
+    cw = session_crop_width if (session_crop_width and session_crop_width > 0.0) else 1.0
+    ch = session_crop_height if (session_crop_height and session_crop_height > 0.0) else 1.0
+    cw = max(0.0, min(1.0, cw))
+    ch = max(0.0, min(1.0, ch))
+    if cw < 1.0 or ch < 1.0:
+        # Named params + default centered x + explicit y=0 (top-aligned)
+        crop_filter = f"crop=w=iw*{cw:.4f}:h=ih*{ch:.4f}:y=0,"
+        print(f"[GRWM] Using session crop: w*{cw:.4f}, h*{ch:.4f}, y=0 (top-aligned)")
+    else:
+        crop_filter = ""
+        print("[GRWM] No crop (session_crop_width/height not set or both == 1.0)")
+
     # ---- Build inputs list and filter graph ----
     # Each scene becomes ONE -i with input-side -ss / -t, so ffmpeg seeks
     # via the container index to the nearest keyframe before the requested
@@ -1691,10 +1733,13 @@ def generate_grwm_script(session_dir):
             ))
             in_lbl = f"[{input_idx}:v]"
             scene_lbl = f"[s{input_idx}]"
-            # No trim filter — -ss/-t handle range selection at the input
-            # level. Just normalize PTS, scale-to-fit, and letterbox-pad.
+            # Per-scene chain:
+            #  1. Session crop (matches live MPV) — if cw/ch < 1.0
+            #  2. setpts reset (each input has its own timebase post-seek)
+            #  3. scale-to-fit inside the cell, keeping aspect
+            #  4. letterbox-pad to fill the cell exactly
             filter_lines.append(
-                f"{in_lbl}setpts=PTS-STARTPTS,"
+                f"{in_lbl}{crop_filter}setpts=PTS-STARTPTS,"
                 f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
                 f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
                 f"{scene_lbl}"
@@ -1863,6 +1908,11 @@ def generate_grwm_script(session_dir):
 def play_videos(config, video_list):
     """Starts MPV instances based on config and video list, prepares for cycling."""
     global sockets, processes, person_socket_map, interrupt_event
+    global session_crop_width, session_crop_height
+
+    # Snapshot the live crop factors so GRWM can reproduce the same view.
+    session_crop_width = float(config.crop_width) if config.crop_width else 0.0
+    session_crop_height = float(config.crop_height) if config.crop_height else 0.0
 
     # --- Reset global state ---
     print("Initializing playback...")
@@ -2537,21 +2587,39 @@ def force_shutdown_and_exit():
 
 
 def on_press(key):
-    """Keyboard listener callback for key presses. 'q' or ESC triggers
-    immediate shutdown. 'e' triggers a CSP swap across all cells and
-    locks cycling."""
+    """Keyboard listener callback for key presses.
+
+    Keybinds:
+      q / ESC  - immediate shutdown
+      e        - CSP swap across all cells + lock cycling
+      + / =    - increase panscan (zoom/crop tighter)
+      -        - decrease panscan (zoom out)
+    """
     should_quit = False
     try:
         if hasattr(key, 'char') and key.char:
-            ch = key.char.lower()
-            if ch == 'q':
+            ch = key.char
+            low = ch.lower()
+            if low == 'q':
                 should_quit = True
-            elif ch == 'e':
+            elif low == 'e':
                 try:
                     trigger_csp_swap()
                 except Exception as e:
                     print(f"[E key] trigger_csp_swap error: {e}")
                 return  # don't quit
+            elif ch in ('+', '='):
+                try:
+                    adjust_panscan(PANSCAN_STEP)
+                except Exception as e:
+                    print(f"[panscan +] error: {e}")
+                return
+            elif ch == '-':
+                try:
+                    adjust_panscan(-PANSCAN_STEP)
+                except Exception as e:
+                    print(f"[panscan -] error: {e}")
+                return
         if key == Key.esc:
             should_quit = True
 
