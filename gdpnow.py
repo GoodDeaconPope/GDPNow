@@ -79,6 +79,141 @@ class MpvIpcClient:
     - Connects to \\.\pipe\mpvsocket{N}
     - Starts a reader thread that drains JSON messages from mpv
     - Provides send() and send_json() methods
+
+    ========================================================================
+    TODO: REWRITE WITH FILE_FLAG_OVERLAPPED (owner: GoodDeaconPope, priority: medium)
+    ========================================================================
+
+    WHY THIS NEEDS A REWRITE
+    ------------------------
+    This class opens the pipe handle SYNCHRONOUSLY (no
+    FILE_FLAG_OVERLAPPED). Per Microsoft's CreateFile docs:
+
+        "If this flag is not specified, then I/O operations are
+         serialized, even if the calls to the read and write functions
+         specify an OVERLAPPED structure."
+
+    Consequence: when the reader thread is parked in a blocking
+    ReadFile() waiting for MPV to send something, any WriteFile() call
+    from another thread on the SAME handle is queued behind the pending
+    ReadFile at the I/O Manager level. Windows serializes the ops —
+    "one I/O at a time on a sync handle" — regardless of which Python
+    thread initiated the call.
+
+    In practice: if MPV is quiet (no command replies, no events), the
+    reader sits blocked forever, and every subsequent send() deadlocks
+    waiting its turn. This happened real-world when cycled_persons=1
+    (no cycle thread firing loadfile events) and the user pressed E to
+    trigger CSP swap — trigger_csp_swap() hung at the first
+    sockets[i].send(cmd) call. Repeated E presses just queued more
+    stuck sends.
+
+    The current workaround in gdpnow is _send_fresh() at
+    ~line 1561, which opens a brand-new short-lived pipe handle per
+    command, WriteFiles, closes. Each fresh handle has its own
+    independent I/O queue so it doesn't contend with the persistent
+    reader thread. That's fine for fire-and-forget commands (CSP swap,
+    panscan, loadfile) but it's a band-aid — it does not allow reading
+    replies, which is what this class is supposed to enable.
+
+    HOW TO REWRITE
+    --------------
+    The correct solution is async / overlapped I/O:
+
+    1. Open the handle with FILE_FLAG_OVERLAPPED in connect():
+         self.handle = win32file.CreateFile(
+             self.pipe_name,
+             win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+             win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+             None,
+             win32file.OPEN_EXISTING,
+             win32con.FILE_FLAG_OVERLAPPED,   # <-- THE KEY CHANGE
+             None,
+         )
+
+    2. Every ReadFile / WriteFile call now takes a PyOVERLAPPED struct
+       with an hEvent. The call returns immediately; you wait on the
+       event with WaitForSingleObject or WaitForMultipleObjects.
+
+       Example read:
+         overlapped = pywintypes.OVERLAPPED()
+         overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+         try:
+             rc, _ = win32file.ReadFile(self.handle, buf, overlapped)
+             # rc == ERROR_IO_PENDING is normal; the op is in flight
+         except pywintypes.error as e:
+             if e.winerror != winerror.ERROR_IO_PENDING:
+                 raise
+         wait_rc = win32event.WaitForSingleObject(overlapped.hEvent, timeout_ms)
+         if wait_rc == win32event.WAIT_TIMEOUT:
+             win32file.CancelIoEx(self.handle, overlapped)
+             ...
+         nbytes = win32file.GetOverlappedResult(self.handle, overlapped, False)
+
+       Same pattern for WriteFile. Need to clean up the hEvent handle
+       in every path (try/finally on CloseHandle).
+
+    3. _reader_loop() becomes a wait-driven loop:
+         - Issue an overlapped ReadFile into a persistent buffer
+         - WaitForSingleObject on the read event + a stop event
+         - On stop-event signal, CancelIoEx and exit cleanly
+         - On read completion, parse newline-delimited JSON, enqueue
+
+    4. send() (and send_json()) becomes:
+         - Issue an overlapped WriteFile
+         - Wait with a timeout (e.g. 2s)
+         - On timeout, CancelIoEx and raise a TimeoutError
+         - This no longer needs self.lock because overlapped writes
+           don't contend with overlapped reads. You may still want a
+           lock to serialize multiple write callers for JSON framing,
+           but it can be a much narrower critical section.
+
+    5. Add a send_and_wait_reply(request_id, timeout) helper that
+       sends a command with a request_id, then drains messages from
+       self._messages until one matching that id appears. This is what
+       enables querying properties like time-pos / filename and
+       eliminates the need for _send_fresh() entirely.
+
+    FILES TO TOUCH
+    --------------
+    - This class definition (connect, _reader_loop, send, send_json,
+      close). Adds ~80-120 lines of overlapped I/O ceremony.
+    - Remove _send_fresh(), _pipe_name_for() helpers once MpvIpcClient
+      is reliable again. Update trigger_csp_swap() and adjust_panscan()
+      to go through sockets[i].send() again.
+    - Cycle_videos already uses sockets[i].send via its inner helper —
+      no code change needed there, but it benefits from the fix
+      automatically.
+    - Connect path in play_videos calls `create_socket(i)` which
+      should work unchanged; that helper just instantiates and calls
+      connect().
+
+    TESTING
+    -------
+    - Start a session with cycled_persons=1 (NO cycling) and immediately
+      press E. With the old sync-handle code, this would deadlock. With
+      overlapped, it should swap instantly.
+    - Spam E and +/- rapidly. Should never hang the listener and every
+      send should complete within ~2s or report timeout cleanly.
+    - Kill an MPV process externally (Task Manager) and try to send to
+      its pipe. Should error out within a few seconds, not hang.
+    - Verify reader thread drains events during a long cycle_videos
+      run — no leaked memory, no stuck threads at session end.
+    - Add a smoke test that exercises send_and_wait_reply to query
+      time-pos on cell 0 and compare against the wall-clock estimate
+      NutCounter uses for labels. Good sanity check.
+
+    REFERENCES
+    ----------
+    - MS docs on CreateFile / FILE_FLAG_OVERLAPPED:
+      https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    - MS docs on named pipes + I/O serialization behavior:
+      https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-input-and-output
+    - pywintypes.OVERLAPPED / win32file usage examples in the pywin32
+      test suite (look for test_win32file_overlapped).
+    - Working overlapped IPC reference impl: mpv's own client.c in the
+      libmpv source (it uses Windows overlapped I/O on the pipe).
+    ========================================================================
     """
 
     def __init__(self, pipe_name):
@@ -1626,11 +1761,15 @@ def _pipe_name_for(socket_idx):
 def adjust_panscan(delta):
     """Send an 'add panscan <delta>' command to every active cell via a
     fresh pipe handle per cell. MPV clamps the resulting value to
-    [0.0, 1.0] automatically."""
+    [0.0, 1.0] automatically.
+
+    The 'no-osd' prefix on the command suppresses MPV's OSD overlay
+    text ("Panscan: 0.05") that would otherwise flash on every cell
+    on each press. See mpv input-command prefix docs."""
     global sockets
     sent = 0
     failed = 0
-    cmd = f"add panscan {delta:+.3f}"
+    cmd = f"no-osd add panscan {delta:+.3f}"
     for i, client in enumerate(sockets):
         if client is None:
             continue
