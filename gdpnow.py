@@ -2107,13 +2107,19 @@ def generate_grwm_script(session_dir):
         print("[GRWM] No crop (session_crop_width/height not set or both == 1.0)")
 
     # ---- Panscan strategy summary ----
-    # Per-scene fill_mode (increase=fill / decrease=letterbox) is now
-    # selected based on that scene's panscan value, derived from the
-    # panscan_events timeline computed above. Scenes that span a panscan
-    # change are already split into sub-scenes with constant panscan.
-    # For the summary log, report the final/latest panscan value.
     panscan_final = max(0.0, min(1.0, float(session_panscan)))
     print(f"[GRWM] Panscan final={panscan_final:.2f}, timeline events={len(panscan_events)}")
+    if len(panscan_events) > 1:
+        # Log each threshold crossing so the user can see what GRWM
+        # actually detected. Only log events that actually change fill
+        # class — the merge optimization drops the rest.
+        prev_class = None
+        for w, v in panscan_events:
+            klass = "fill" if v >= 0.5 else "letterbox"
+            if klass != prev_class:
+                rel_t = w - session_start
+                print(f"[GRWM]   t={rel_t:+6.2f}s panscan={v:.2f} -> {klass}")
+                prev_class = klass
 
     def _fill_for(panscan_value):
         """Return (fill_mode, fill_suffix) for a given panscan value.
@@ -2284,26 +2290,22 @@ def generate_grwm_script(session_dir):
             f.write(f"FILTER_SCRIPT = {filter_script_path!r}\n")
             f.write(f"OUTPUT = {output_video!r}\n\n")
             f.write("cmd = ['ffmpeg', '-y', '-hide_banner']\n")
-            f.write("# Classic fast+accurate hybrid seek pattern:\n")
-            f.write("#   -noaccurate_seek -ss <start-buffer> -i file -ss <buffer> -t <dur>\n")
-            f.write("# Input-side -ss jumps to the nearest keyframe via the container\n")
-            f.write("# index (instant, no decode). Output-side -ss then decode-discards\n")
-            f.write("# for exactly 'buffer' seconds to reach the precise target. This\n")
-            f.write("# bounds the total decode to ~buffer+GOP seconds per scene — way\n")
-            f.write("# faster than the trim filter (which decodes from frame 0) and\n")
-            f.write("# avoids the -accurate_seek + hwaccel edge cases that can cause\n")
-            f.write("# ffmpeg to spin forever before the first frame.\n")
-            f.write("SEEK_BUFFER = 10.0\n")
+            f.write("# Input-side -ss with default -accurate_seek (fast+accurate).\n")
+            f.write("# Modern ffmpeg automatically does the 'seek to closest keyframe\n")
+            f.write("# then decode-and-discard to the exact target' pattern when -ss\n")
+            f.write("# is placed before -i. No need for the old manual hybrid split\n")
+            f.write("# (-noaccurate_seek + output-side -ss) which was actually broken:\n")
+            f.write("# with -noaccurate_seek the input stream keeps source PTS values,\n")
+            f.write("# so a subsequent output-side -ss tried to discard until PTS\n")
+            f.write("# reached a small number which was already long-passed, and\n")
+            f.write("# output started from the wrong keyframe instead of the target.\n")
+            f.write("# That caused scenes to show content up to GOP-size seconds\n")
+            f.write("# before the intended CSP position — which looked to the user\n")
+            f.write("# like 'first video didn't switch to CSP'.\n")
             f.write("for (p, start, dur) in INPUTS:\n")
-            f.write("    if start > SEEK_BUFFER:\n")
-            f.write("        fast, slow = start - SEEK_BUFFER, SEEK_BUFFER\n")
-            f.write("    else:\n")
-            f.write("        fast, slow = 0.0, start\n")
             f.write("    cmd += ['-hwaccel', 'cuda',\n")
-            f.write("            '-noaccurate_seek',\n")
-            f.write("            '-ss', f'{fast:.3f}',\n")
+            f.write("            '-ss', f'{start:.3f}',\n")
             f.write("            '-i', p,\n")
-            f.write("            '-ss', f'{slow:.3f}',\n")
             f.write("            '-t', f'{dur:.3f}']\n")
             f.write("cmd += [\n")
             f.write("    '-filter_complex_script', FILTER_SCRIPT,\n")
@@ -2334,6 +2336,7 @@ def generate_grwm_script(session_dir):
             f.write("    '-profile:v', 'high',\n")
             f.write("    '-level', '5.1',\n")              # 5.1 supports up to 4K
             f.write("    '-r', '30000/1001',\n")           # NTSC 29.97 to match sources
+            f.write("    '-fps_mode', 'cfr',\n")           # force constant framerate
             f.write("    '-an',\n")  # no audio (grid mode)
             f.write("    OUTPUT,\n")
             f.write("]\n")
