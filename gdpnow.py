@@ -1386,16 +1386,20 @@ session_video_pan_history = []  # list of (wall_time, x, y)
 # This is the *per-tap* step when the key is briefly pressed and released
 # (single discrete movement). Held-down arrow keys use a separate smooth
 # animation thread (see _pan_animator below) with a smaller per-tick delta
-# so motion looks fluid instead of jerky 5% jumps.
-VIDEO_PAN_STEP = 0.03
+# so motion looks fluid instead of jerky jumps. Tuned down from 0.03
+# because even a single quick tap was moving the image too much — the
+# user wants subtle framing tweaks, not full-scene jumps.
+VIDEO_PAN_STEP = 0.015
 
 # Smooth-pan animation constants. While any arrow key is held, a single
 # background thread ticks at PAN_TICK_HZ and emits PAN_TICK_STEP-sized
-# deltas for each held direction. Rate math: 33Hz * 0.015 = ~50%/sec held
-# pan, so the full [-1, 1] range takes ~4s of sustained hold — slow enough
-# to stop on a specific spot, fast enough not to feel sluggish.
+# deltas for each held direction. Rate math: 33Hz * 0.007 = ~23%/sec held
+# pan, so the full [-1, 1] range takes ~8.5s of sustained hold — slow
+# enough to land on a specific spot without overshooting, and matched to
+# the smaller per-tap step so holding feels like repeated taps not a
+# runaway slider.
 PAN_TICK_HZ = 33
-PAN_TICK_STEP = 0.015
+PAN_TICK_STEP = 0.007
 
 # Held-state + animator thread globals (see _pan_key_down / _pan_animator)
 _pan_held = {("x", +1): False, ("x", -1): False, ("y", +1): False, ("y", -1): False}
@@ -1854,25 +1858,31 @@ def _pipe_name_for(socket_idx):
 
 
 def adjust_panscan(delta):
-    """Send an 'add panscan <delta>' command to every active cell via a
-    fresh pipe handle per cell. MPV clamps the resulting value to
-    [0.0, 1.0] automatically.
+    """Set panscan to (current + delta) on every active cell via a fresh
+    pipe handle per cell, using 'no-osd set panscan <abs>' (NOT 'add
+    panscan <delta>'). The set-absolute pattern is idempotent: if any cell
+    missed a previous IPC write — or if MPV reset the property during an
+    intervening loadfile — the next press re-synchronizes all cells to the
+    same absolute value. 'add' would instead let each cell drift from its
+    own possibly-stale local state, producing the visible per-cell size
+    asymmetry that we hit in practice.
 
-    The 'no-osd' prefix on the command suppresses MPV's OSD overlay
-    text ("Panscan: 0.05") that would otherwise flash on every cell
-    on each press. See mpv input-command prefix docs.
+    The 'no-osd' prefix suppresses MPV's OSD overlay text that would
+    otherwise flash on every cell on each press.
 
-    Also updates the module-level session_panscan tracker and appends
-    to session_panscan_history so GRWM knows the final panscan state
-    (and can one day reconstruct time-varying panscan per-scene)."""
+    Also updates the module-level session_panscan tracker and appends to
+    session_panscan_history so GRWM knows the final panscan state."""
     global sockets, session_panscan, session_panscan_history
-    # Track the new value on our side (mirroring MPV's clamp behavior).
+    # Track the new absolute value on our side, clamped to MPV's [0, 1].
     new_value = max(0.0, min(1.0, session_panscan + delta))
+    if new_value == session_panscan:
+        # Already at the clamp wall; don't spam cells with no-op writes.
+        return
     session_panscan = new_value
     session_panscan_history.append((time.time(), new_value))
     sent = 0
     failed = 0
-    cmd = f"no-osd add panscan {delta:+.3f}"
+    cmd = f"no-osd set panscan {new_value:.4f}"
     for i, client in enumerate(sockets):
         if client is None:
             continue
@@ -1887,44 +1897,42 @@ def adjust_panscan(delta):
 
 
 def _adjust_video_pan(axis, delta, quiet=False):
-    """Send an 'add video-pan-<axis> <delta>' command to every active cell
-    via a fresh pipe handle per cell. `axis` must be 'x' or 'y'. MPV clamps
-    the resulting value to [-3.0, 3.0] automatically but we clamp our
-    mirrored tracker to a tighter [-1.0, 1.0] because anything past that
-    pushes the video into empty cell margin (black bars).
+    """Set video-pan-<axis> to (current + delta) on every active cell via a
+    fresh pipe handle per cell. Uses 'no-osd set' (NOT 'add') for the same
+    reason adjust_panscan does: 'add' relies on MPV's local state matching
+    session_video_pan_x/y which can drift after an IPC failure or an
+    intervening loadfile that resets the property. 'set' is idempotent —
+    every keypress re-synchronizes every cell to the same absolute value,
+    which guarantees no asymmetric drift between cells.
+
+    `axis` must be 'x' or 'y'. We clamp to [-1.0, 1.0] rather than MPV's
+    native [-3.0, 3.0] because anything beyond 1.0 pushes the video into
+    empty cell margin (black bars).
 
     `quiet=True` suppresses the per-call log line — used by the smooth-pan
     animator thread which ticks at PAN_TICK_HZ and would otherwise spam the
     console with 30+ lines per second of sustained hold.
-
-    Mirrors adjust_panscan()'s structure: fresh short-lived pipe writes via
-    _send_fresh(), no-osd prefix to suppress flashing overlay text, and
-    updates a module-level session tracker + history list so GRWM can
-    eventually replay time-varying pan state.
     """
     global sockets, session_video_pan_x, session_video_pan_y, session_video_pan_history
     if axis not in ("x", "y"):
         print(f"[video-pan] invalid axis {axis!r}", flush=True)
         return
     if axis == "x":
-        # Clamp-aware delta: if already at the wall, skip the IPC write
-        # entirely so the animator doesn't hammer cells with no-op commands
-        # when the user holds an arrow against the pan limit.
-        clamped_new = max(-1.0, min(1.0, session_video_pan_x + delta))
-        if clamped_new == session_video_pan_x:
+        new_value = max(-1.0, min(1.0, session_video_pan_x + delta))
+        if new_value == session_video_pan_x:
             return
-        session_video_pan_x = clamped_new
+        session_video_pan_x = new_value
     else:
-        clamped_new = max(-1.0, min(1.0, session_video_pan_y + delta))
-        if clamped_new == session_video_pan_y:
+        new_value = max(-1.0, min(1.0, session_video_pan_y + delta))
+        if new_value == session_video_pan_y:
             return
-        session_video_pan_y = clamped_new
+        session_video_pan_y = new_value
     session_video_pan_history.append(
         (time.time(), session_video_pan_x, session_video_pan_y)
     )
     sent = 0
     failed = 0
-    cmd = f"no-osd add video-pan-{axis} {delta:+.3f}"
+    cmd = f"no-osd set video-pan-{axis} {new_value:.4f}"
     for i, client in enumerate(sockets):
         if client is None:
             continue
@@ -1942,6 +1950,64 @@ def _adjust_video_pan(axis, delta, quiet=False):
             f"session = ({session_video_pan_x:+.2f}, {session_video_pan_y:+.2f})",
             flush=True,
         )
+
+
+def _reapply_view_state_to_socket(socket_idx):
+    """Re-send the current panscan + video-pan-x/y state to a single cell.
+    Called after every loadfile so the newly-loaded video inherits the
+    user's current view adjustments even if MPV reset those properties
+    across the file load.
+
+    Uses _send_fresh() with a short timeout to match the load path; all
+    three writes are fire-and-forget (no per-cell failure logging) because
+    a missed write will be corrected on the next user input anyway (the
+    set-based adjust_panscan / _adjust_video_pan functions are idempotent).
+    """
+    try:
+        pipe = _pipe_name_for(socket_idx)
+        # Only bother re-sending non-default values. Default panscan is 1.0
+        # (we launch MPV with --panscan=1), default video-pan-x/y is 0.0.
+        if session_panscan != 1.0:
+            _send_fresh(pipe, f"no-osd set panscan {session_panscan:.4f}",
+                        timeout=2.0, retries=0)
+        if session_video_pan_x != 0.0:
+            _send_fresh(pipe, f"no-osd set video-pan-x {session_video_pan_x:.4f}",
+                        timeout=2.0, retries=0)
+        if session_video_pan_y != 0.0:
+            _send_fresh(pipe, f"no-osd set video-pan-y {session_video_pan_y:.4f}",
+                        timeout=2.0, retries=0)
+    except Exception as e:
+        print(f"[reapply-view] socket {socket_idx}: {e}", flush=True)
+
+
+def reset_video_pan():
+    """Snap video-pan-x and video-pan-y back to 0 on every active cell.
+    Bound to the '0' key as an ergonomic 'recenter' control — manually
+    walking back to center with small arrow-key deltas is tedious and
+    imprecise, this gives a single-keypress reset.
+
+    Does NOT touch panscan. If you also want to reset zoom, press '0'
+    then adjust panscan separately."""
+    global sockets, session_video_pan_x, session_video_pan_y, session_video_pan_history
+    if session_video_pan_x == 0.0 and session_video_pan_y == 0.0:
+        print("[video-pan] already at (0, 0), reset no-op", flush=True)
+        return
+    session_video_pan_x = 0.0
+    session_video_pan_y = 0.0
+    session_video_pan_history.append((time.time(), 0.0, 0.0))
+    sent_x = 0
+    sent_y = 0
+    for i, client in enumerate(sockets):
+        if client is None:
+            continue
+        pipe = _pipe_name_for(i)
+        sx = _send_fresh(pipe, "no-osd set video-pan-x 0.0000", timeout=5.0, retries=1)
+        sy = _send_fresh(pipe, "no-osd set video-pan-y 0.0000", timeout=5.0, retries=1)
+        if sx in ("ok", "retry-ok"):
+            sent_x += 1
+        if sy in ("ok", "retry-ok"):
+            sent_y += 1
+    print(f"[video-pan] reset to (0, 0) -> {sent_x}/{sent_y} cells ok", flush=True)
 
 
 def adjust_video_pan_x(delta):
@@ -2090,6 +2156,9 @@ def trigger_csp_swap():
 
         if status in ("ok", "retry-ok"):
             _update_cell_state(socket_idx, filename, start_sec, meta)
+            # Re-apply panscan + video-pan state to the freshly loaded
+            # video so the CSP swap inherits the current view adjustments.
+            _reapply_view_state_to_socket(socket_idx)
             print(f"  Socket {socket_idx}: OK -> CSP @ {csp_str} (start {start_str}, -{CSP_PRE_ROLL_SEC}s)", flush=True)
             swapped += 1
         else:
@@ -3302,6 +3371,12 @@ def cycle_videos(config):
 
             cmd = f'loadfile {v["filename"]} replace "start={final_start_str}"'
             send_command_to_socket_index(socket_idx, cmd)
+            # Re-apply user's current view adjustments (panscan + video-pan-x/y)
+            # so the newly-loaded video starts at the same zoom/center the
+            # user had before the swap. MPV's default loadfile-replace may
+            # reset these properties depending on version/config — reapplying
+            # guarantees per-cell consistency regardless.
+            _reapply_view_state_to_socket(socket_idx)
             # Record new state for NutCounter + GRWM. Pull full metadata
             # from person_socket_map (v dict only has filename/base_sec).
             scene_metadata = None
@@ -3462,10 +3537,11 @@ def on_press(key):
       e             - CSP swap across all cells + lock cycling (async)
       + / =         - increase panscan (async)
       -             - decrease panscan (async)
+      0             - reset video-pan-x/y to center (async)
       left / right  - pan video horizontally within each cell (async)
       up / down     - pan video vertically within each cell (async)
 
-    E / +/- / arrows are dispatched to background daemon threads so a
+    E / +/- / 0 / arrows are dispatched to background daemon threads so a
     blocking IPC write never freezes the listener and Q/ESC stay responsive.
     """
     should_quit = False
@@ -3483,6 +3559,12 @@ def on_press(key):
                 return
             elif ch == '-':
                 _run_async(adjust_panscan, -PANSCAN_STEP, name="Panscan-")
+                return
+            elif ch == '0':
+                # Ergonomic recenter: snap video-pan-x/y back to 0 in a
+                # single keypress. Small arrow-key deltas make it tedious
+                # to walk manually back to center.
+                _run_async(reset_video_pan, name="VPanReset")
                 return
         # Arrow keys: smooth continuous pan via the animator thread. We
         # send ONE immediate tap-sized delta on the first press (for
