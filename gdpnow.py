@@ -1568,21 +1568,80 @@ def _resolve_source_path(filename):
 CSP_PRE_ROLL_SEC = 2  # start playback this many seconds before the CSP marker
 
 
+def _send_fresh(pipe_name, cmd_str, timeout=2.0):
+    """Send a single command to an MPV IPC pipe via a fresh, short-lived
+    handle. Bypasses MpvIpcClient entirely so its persistent reader thread
+    can't interfere with the write.
+
+    Runs the CreateFile/WriteFile/CloseHandle sequence on an inner daemon
+    thread and joins with a timeout. If the inner thread blocks (broken
+    pipe, MPV frozen, buffer full, whatever), the caller gets "timeout"
+    and moves on — the stuck inner thread stays alive as a daemon but
+    does not block anything we care about.
+
+    Returns: 'ok' | 'timeout' | 'error: <msg>'
+    """
+    if not cmd_str.endswith("\n"):
+        cmd_str += "\n"
+    data = cmd_str.encode("utf-8")
+    result = {"status": None}
+
+    def _do():
+        handle = None
+        try:
+            handle = win32file.CreateFile(
+                pipe_name,
+                win32file.GENERIC_WRITE,
+                0,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None,
+            )
+            win32file.WriteFile(handle, data)
+            result["status"] = "ok"
+        except pywintypes.error as e:
+            result["status"] = f"error: {e}"
+        except Exception as e:
+            result["status"] = f"error: {e}"
+        finally:
+            if handle is not None:
+                try:
+                    win32file.CloseHandle(handle)
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_do, daemon=True, name="PipeSend")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return "timeout"
+    return result["status"] or "error: unknown"
+
+
+def _pipe_name_for(socket_idx):
+    return rf"\\.\pipe\mpvsocket{socket_idx}"
+
+
 def adjust_panscan(delta):
-    """Send an 'add panscan <delta>' command to every active cell.
-    MPV clamps the resulting value to [0.0, 1.0] automatically."""
+    """Send an 'add panscan <delta>' command to every active cell via a
+    fresh pipe handle per cell. MPV clamps the resulting value to
+    [0.0, 1.0] automatically."""
     global sockets
     sent = 0
+    failed = 0
+    cmd = f"add panscan {delta:+.3f}"
     for i, client in enumerate(sockets):
         if client is None:
             continue
-        try:
-            client.send(f"add panscan {delta:+.3f}")
+        status = _send_fresh(_pipe_name_for(i), cmd, timeout=1.5)
+        if status == "ok":
             sent += 1
-        except Exception as e:
-            print(f"[panscan] socket {i} failed: {e}")
+        else:
+            failed += 1
+            print(f"[panscan] socket {i}: {status}", flush=True)
     sign = "+" if delta > 0 else ""
-    print(f"[panscan] {sign}{delta:.2f} sent to {sent} cells")
+    print(f"[panscan] {sign}{delta:.2f} -> {sent} ok, {failed} failed", flush=True)
 
 
 def trigger_csp_swap():
@@ -1590,9 +1649,10 @@ def trigger_csp_swap():
     that video's CSP position (with a small pre-roll), then engage
     e_locked so the cycle thread stops further switching.
 
-    Runs on a background daemon thread spawned by on_press so a blocking
-    IPC send can never freeze the keyboard listener. Explicit flush=True
-    on every print so hangs are visible immediately in real-time."""
+    Uses _send_fresh() (fresh short-lived pipe handles with a 2s timeout)
+    instead of the persistent MpvIpcClient, so a stuck WriteFile on the
+    shared reader/writer handle can't hang the CSP swap. Runs on a
+    background daemon thread spawned by on_press."""
     global sockets
     print("\n[E] CSP SWAP TRIGGERED ============================", flush=True)
     snap = _snapshot_cell_state()
@@ -1600,42 +1660,60 @@ def trigger_csp_swap():
     if not snap:
         print("[E] No cell state — nothing to swap.", flush=True)
         return
+
+    live_slot_count = len(sockets)
+    live_slots = [s is not None for s in sockets]
+    print(f"[E] live socket slots: {live_slot_count} ({sum(live_slots)} non-None)", flush=True)
+
     swapped = 0
     skipped = 0
     for socket_idx in sorted(snap.keys()):
         info = snap[socket_idx]
-        if socket_idx >= len(sockets) or sockets[socket_idx] is None:
-            print(f"  Socket {socket_idx}: no live socket, skipping.")
+        print(f"[E] -> cell {socket_idx}: {info.get('filename', '?')}", flush=True)
+
+        if socket_idx >= live_slot_count:
+            print(f"  Socket {socket_idx}: index out of range (slots={live_slot_count}), skipping.", flush=True)
             skipped += 1
-            continue  # flush ensured by preceding print
+            continue
+        if not live_slots[socket_idx]:
+            print(f"  Socket {socket_idx}: slot is None, skipping.", flush=True)
+            skipped += 1
+            continue
+
         meta = info.get("metadata") or {}
         csp_str = meta.get("CSP")
+        print(f"  Socket {socket_idx}: meta keys={list(meta.keys())}, CSP={csp_str!r}", flush=True)
         if not csp_str:
-            print(f"  Socket {socket_idx}: no CSP in metadata for {info['filename']}, skipping.")
+            print(f"  Socket {socket_idx}: no CSP in metadata for {info['filename']}, skipping.", flush=True)
             skipped += 1
-            continue  # flush ensured by preceding print
+            continue
         try:
             csp_sec = mmss_to_seconds(csp_str)
-        except Exception:
-            print(f"  Socket {socket_idx}: bad CSP value {csp_str!r}, skipping.")
+        except Exception as e:
+            print(f"  Socket {socket_idx}: bad CSP value {csp_str!r} ({e}), skipping.", flush=True)
             skipped += 1
-            continue  # flush ensured by preceding print
-        # Pre-roll: back up a couple seconds so the climax has lead-in.
+            continue
+
         start_sec = max(0, csp_sec - CSP_PRE_ROLL_SEC)
         start_str = seconds_to_mmss(start_sec)
         filename = info["filename"]
         cmd = f'loadfile {filename} replace "start={start_str}"'
-        try:
-            sockets[socket_idx].send(cmd)
+        pipe_name = _pipe_name_for(socket_idx)
+
+        print(f"  Socket {socket_idx}: sending via {pipe_name}: {cmd}", flush=True)
+        status = _send_fresh(pipe_name, cmd, timeout=2.0)
+        print(f"  Socket {socket_idx}: send status = {status}", flush=True)
+
+        if status == "ok":
             _update_cell_state(socket_idx, filename, start_sec, meta)
-            print(f"  Socket {socket_idx}: {filename} -> CSP @ {csp_str} (start {start_str}, -{CSP_PRE_ROLL_SEC}s)")
+            print(f"  Socket {socket_idx}: OK -> CSP @ {csp_str} (start {start_str}, -{CSP_PRE_ROLL_SEC}s)", flush=True)
             swapped += 1
-        except Exception as e:
-            print(f"  Socket {socket_idx}: send failed: {e}")
+        else:
             skipped += 1
+
     e_locked.set()
-    print(f"[E] Swapped {swapped}, skipped {skipped}. Cycling locked on CSP.")
-    print("[E] Press Q or ESC to finalize the session.")
+    print(f"[E] Swapped {swapped}, skipped {skipped}. Cycling locked on CSP.", flush=True)
+    print("[E] Press Q or ESC to finalize the session.", flush=True)
 
 
 def generate_grwm_script(session_dir):
