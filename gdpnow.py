@@ -1276,6 +1276,8 @@ class NutCounter:
         self.base_final_dir = output_dir or self.DEFAULT_OUTPUT_DIR
         self._fallback_warned = False
         self._host_seen = False
+        self._last_host_bbox = None  # last known good host rect
+        self._skipped_pre_host = 0   # counter for early skipped captures
         self._font_cache = {}  # size -> ImageFont
 
     def start(self, fallback_bbox, column_grid=1, row_grid=1):
@@ -1416,15 +1418,21 @@ class NutCounter:
         bbox = self._get_host_bbox()
         if bbox is not None:
             if not self._host_seen:
-                print(f"[NutCounter] Host window found, capturing client area: {bbox}")
+                print(f"[NutCounter] Host window found after skipping {self._skipped_pre_host} pre-host captures: {bbox}")
                 self._host_seen = True
+            self._last_host_bbox = bbox
         else:
-            bbox = self.fallback_bbox
+            if not self._host_seen:
+                # Host never appeared yet — skip this capture entirely so
+                # we don't record the terminal / desktop background during
+                # the MPV launch + GridHost creation window.
+                self._skipped_pre_host += 1
+                return
+            # Host has been seen before but is momentarily un-findable
+            # (maybe minimized during a transition). Use last known rect.
+            bbox = self._last_host_bbox
             if bbox is None:
                 return
-            if not self._fallback_warned:
-                print(f"[NutCounter] Host window not found, using fallback bbox: {bbox}")
-                self._fallback_warned = True
         try:
             img = ImageGrab.grab(bbox=bbox, all_screens=True)
             img = self._annotate(img)
@@ -1648,9 +1656,18 @@ def generate_grwm_script(session_dir):
     cell_h = (out_h // rg) - ((out_h // rg) % 2)  # even
 
     # ---- Build inputs list and filter graph ----
-    inputs = []          # absolute paths, one -i per scene
+    # Each scene becomes ONE -i with input-side -ss / -t, so ffmpeg seeks
+    # via the container index to the nearest keyframe before the requested
+    # start time. This is ~100x faster than the `trim` filter, which would
+    # force ffmpeg to decode from frame 0 of each source just to discard
+    # thousands of frames before reaching the requested start (catastrophic
+    # on 4K 51-minute sources — what looked like "CPU spinning forever"
+    # was actually the trim filter wasting all its time on upstream decodes).
+    #
+    # inputs_spec: list of (path, start_sec, duration_sec) tuples
+    inputs_spec = []
     filter_lines = []
-    cell_stream_labels = []  # in grid order
+    cell_stream_labels = []
 
     input_idx = 0
     for socket_idx in range(grid_size):
@@ -1667,12 +1684,17 @@ def generate_grwm_script(session_dir):
 
         per_scene_labels = []
         for scene in scenes:
-            inputs.append(_resolve_source_path(scene["filename"]))
+            inputs_spec.append((
+                _resolve_source_path(scene["filename"]),
+                scene["in_sec"],
+                scene["duration"],
+            ))
             in_lbl = f"[{input_idx}:v]"
             scene_lbl = f"[s{input_idx}]"
+            # No trim filter — -ss/-t handle range selection at the input
+            # level. Just normalize PTS, scale-to-fit, and letterbox-pad.
             filter_lines.append(
-                f"{in_lbl}trim=start={scene['in_sec']:.3f}:duration={scene['duration']:.3f},"
-                f"setpts=PTS-STARTPTS,"
+                f"{in_lbl}setpts=PTS-STARTPTS,"
                 f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
                 f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
                 f"{scene_lbl}"
@@ -1691,6 +1713,9 @@ def generate_grwm_script(session_dir):
                 f"{concat_in}concat=n={len(per_scene_labels)}:v=1:a=0{cell_lbl}"
             )
         cell_stream_labels.append(cell_lbl)
+
+    # Keep legacy `inputs` name for downstream runner generation.
+    inputs = [spec[0] for spec in inputs_spec]
 
     # ---- xstack the cells into a grid ----
     if grid_size == 1:
@@ -1727,15 +1752,24 @@ def generate_grwm_script(session_dir):
             f.write(f"# Grid: {cg}x{rg}, {len(inputs)} scenes, {total_duration:.1f}s total\n")
             f.write("# NVENC H264 high quality (preset p7, cq 18)\n")
             f.write("import subprocess, sys\n\n")
+            f.write("# (path, start_sec, duration_sec) per scene — input-side\n")
+            f.write("# seeking so ffmpeg skips prior frames via the container index.\n")
             f.write("INPUTS = [\n")
-            for inp in inputs:
-                f.write(f"    {inp!r},\n")
+            for (path, start, dur) in inputs_spec:
+                f.write(f"    ({path!r}, {start:.3f}, {dur:.3f}),\n")
             f.write("]\n\n")
             f.write(f"FILTER_SCRIPT = {filter_script_path!r}\n")
             f.write(f"OUTPUT = {output_video!r}\n\n")
             f.write("cmd = ['ffmpeg', '-y', '-hide_banner']\n")
-            f.write("for p in INPUTS:\n")
-            f.write("    cmd += ['-i', p]\n")
+            f.write("# NVDEC per input: huge speedup for 4K h264 decoding.\n")
+            f.write("# Input-side -ss/-t: seek via container index to the nearest\n")
+            f.write("# keyframe BEFORE the requested start, instead of decoding\n")
+            f.write("# from frame 0 and discarding. Makes 4K sources actually usable.\n")
+            f.write("for (p, start, dur) in INPUTS:\n")
+            f.write("    cmd += ['-hwaccel', 'cuda',\n")
+            f.write("            '-ss', f'{start:.3f}',\n")
+            f.write("            '-t', f'{dur:.3f}',\n")
+            f.write("            '-i', p]\n")
             f.write("cmd += [\n")
             f.write("    '-filter_complex_script', FILTER_SCRIPT,\n")
             f.write("    '-map', '[out]',\n")
@@ -1754,19 +1788,27 @@ def generate_grwm_script(session_dir):
             f.write("    OUTPUT,\n")
             f.write("]\n")
             f.write("print(f'Running ffmpeg with {len(INPUTS)} inputs...')\n")
+            f.write("print('First frame may take 10-30s on 4K sources — be patient, DO NOT press q.')\n")
             f.write("sys.exit(subprocess.run(cmd).returncode)\n")
     except OSError as e:
         print(f"[GRWM] Failed to write runner: {e}")
         return
 
     # ---- Write thin .bat wrapper for double-click convenience ----
+    # The bat file must be pure ASCII because cmd.exe reads batch files in
+    # the active code page (typically cp1252 on Windows) — if the file
+    # contains U+A789 "꞉" from the session folder name, cmd can't parse
+    # the affected lines and you get "The system cannot find the path
+    # specified." errors. %~dp0 is a runtime wide-char expansion that
+    # produces the correct unicode path without appearing in the file
+    # source, so the bat file stays ASCII-clean.
     bat_path = os.path.join(session_dir, "run_grwm.bat")
     try:
-        with open(bat_path, "w", encoding="utf-8", newline="\r\n") as f:
+        with open(bat_path, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
             f.write("@echo off\r\n")
             f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(inputs)} scenes\r\n")
-            f.write(f"cd /d \"{session_dir}\"\r\n")
-            f.write("python run_grwm.py\r\n")
+            f.write("REM %~dp0 = this bat file's own dir, handles unicode paths correctly\r\n")
+            f.write("python \"%~dp0run_grwm.py\"\r\n")
             f.write("pause\r\n")
     except OSError as e:
         print(f"[GRWM] Failed to write bat: {e}")
