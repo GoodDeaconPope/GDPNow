@@ -333,91 +333,101 @@ class MpvIpcClient:
 # ---------- GridHost helpers (outer resizable window) ----------
 def _enum_windows_for_pids(pid_list, grid_size, max_wait=20.0, interval=0.05):
     """
-    Try to find up to grid_size mpv top-level windows.
+    Find up to grid_size mpv top-level windows and return them IN THE SAME
+    ORDER as pid_list.
 
-    1) Prefer windows whose PID is in pid_list.
-    2) If we still don't have enough, fallback to visible windows whose
-       class == 'mpv' or whose title looks like an mpv window.
+    The ordering matters because _tile_children() places child_hwnds[i] at
+    grid position (i % cols, i // cols), and NutCounter draws labels for
+    socket_idx at the same grid position. If the returned list was in
+    EnumWindows Z-order (which is random relative to PID order), socket 0's
+    video could end up visually in grid position 1 while its label gets
+    drawn at grid position 0 — wrong tile.
 
-    IMPORTANT FIX:
-      - We now KEEP accumulating hwnds across attempts
-      - We only stop early when we've collected >= grid_size windows
+    Algorithm:
+    1. Map pid -> hwnd as we find matching windows.
+    2. Build the return list by iterating pid_list and picking up each
+       corresponding hwnd, so order matches the caller's expectation.
+    3. Fallback by class/title only appends unknown extras at the end if
+       we couldn't fill by PID.
     """
     import time
     import win32gui
     import win32process
 
     wanted_pids = set(pid_list)
-    found_hwnds = []
+    pid_to_hwnd = {}  # pid -> hwnd (first match wins)
 
     def pid_callback(hwnd, extra):
-        # If we've already got enough, don't bother doing more work
-        if len(found_hwnds) >= grid_size:
+        if len(pid_to_hwnd) >= grid_size:
             return
-
         if not win32gui.IsWindowVisible(hwnd):
             return
-
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
         except Exception:
             return
-
-        if pid in wanted_pids and hwnd not in found_hwnds:
-            found_hwnds.append(hwnd)
+        if pid in wanted_pids and pid not in pid_to_hwnd:
+            pid_to_hwnd[pid] = hwnd
 
     deadline = time.time() + max_wait
     attempt = 0
 
     # --- Primary search: by PID ---
-    while time.time() < deadline and len(found_hwnds) < grid_size:
+    while time.time() < deadline and len(pid_to_hwnd) < grid_size:
         attempt += 1
         win32gui.EnumWindows(pid_callback, None)
-        print(f"GridHost: PID search attempt {attempt}, found so far: {found_hwnds}")
-        if len(found_hwnds) >= grid_size:
+        print(f"GridHost: PID search attempt {attempt}, found {len(pid_to_hwnd)}/{grid_size}")
+        if len(pid_to_hwnd) >= grid_size:
             break
         time.sleep(interval)
 
+    # --- Build ordered list matching pid_list order ---
+    ordered_hwnds = []
+    for pid in pid_list:
+        if pid in pid_to_hwnd:
+            ordered_hwnds.append(pid_to_hwnd[pid])
+
+    print(f"GridHost: Ordered HWNDs (matching pid_list): {ordered_hwnds}")
+
     # --- Fallback search: by class/title, ONLY if still short ---
-    if len(found_hwnds) < grid_size:
+    # These appended extras have unknown socket binding, but that's the
+    # last resort — they get tacked on at the end so pid-matched ones
+    # keep their correct positions.
+    if len(ordered_hwnds) < grid_size:
         extra_hwnds = []
 
         def fallback_callback(hwnd, extra):
-            if len(found_hwnds) + len(extra_hwnds) >= grid_size:
+            if len(ordered_hwnds) + len(extra_hwnds) >= grid_size:
                 return
-
             if not win32gui.IsWindowVisible(hwnd):
                 return
-
             try:
                 cls = win32gui.GetClassName(hwnd)
                 title = win32gui.GetWindowText(hwnd)
             except Exception:
                 return
-
             title_l = title.lower()
             looks_like_mpv = (
                 cls.lower() == "mpv"
                 or ".mp4" in title_l
                 or "mpv" in title_l
             )
-
-            if looks_like_mpv and hwnd not in found_hwnds and hwnd not in extra_hwnds:
+            if looks_like_mpv and hwnd not in ordered_hwnds and hwnd not in extra_hwnds:
                 extra_hwnds.append(hwnd)
 
         win32gui.EnumWindows(fallback_callback, None)
         if extra_hwnds:
             print(f"GridHost: Fallback HWNDs by class/title: {extra_hwnds}")
             for h in extra_hwnds:
-                if len(found_hwnds) >= grid_size:
+                if len(ordered_hwnds) >= grid_size:
                     break
-                found_hwnds.append(h)
+                ordered_hwnds.append(h)
 
     # Final trim (safety)
-    if len(found_hwnds) > grid_size:
-        found_hwnds = found_hwnds[:grid_size]
+    if len(ordered_hwnds) > grid_size:
+        ordered_hwnds = ordered_hwnds[:grid_size]
 
-    return found_hwnds
+    return ordered_hwnds
 
 def _create_drag_overlay_for_host(host_hwnd):
     """
@@ -1343,6 +1353,22 @@ session_crop_height = None
 session_output_w = None
 session_output_h = None
 
+# Live session panscan tracking. Starts at 1.0 to match MPV's --panscan=1
+# flag in create_mpv_command. adjust_panscan() updates this by delta and
+# clamps to [0, 1]. GRWM reads this at generation time to pick its
+# fill/letterbox strategy.
+#
+# TODO (1:1 time-varying panscan): panscan_history lets us know WHEN the
+# user changed panscan during the session. A future GRWM pass could split
+# each scene at panscan change wall-times and apply a different scale/crop
+# factor per sub-scene. Requires ffprobing each source to learn its aspect
+# ratio, then lerping the scale factor between decrease-fit and
+# increase-fill based on the panscan value. For now GRWM uses the FINAL
+# session_panscan value for the entire replay and logs a warning if the
+# value was changed during the session.
+session_panscan = 1.0
+session_panscan_history = []  # list of (wall_time, value)
+
 # +/- panscan adjustment step (MPV panscan property range is [0.0, 1.0])
 PANSCAN_STEP = 0.05
 
@@ -1765,8 +1791,16 @@ def adjust_panscan(delta):
 
     The 'no-osd' prefix on the command suppresses MPV's OSD overlay
     text ("Panscan: 0.05") that would otherwise flash on every cell
-    on each press. See mpv input-command prefix docs."""
-    global sockets
+    on each press. See mpv input-command prefix docs.
+
+    Also updates the module-level session_panscan tracker and appends
+    to session_panscan_history so GRWM knows the final panscan state
+    (and can one day reconstruct time-varying panscan per-scene)."""
+    global sockets, session_panscan, session_panscan_history
+    # Track the new value on our side (mirroring MPV's clamp behavior).
+    new_value = max(0.0, min(1.0, session_panscan + delta))
+    session_panscan = new_value
+    session_panscan_history.append((time.time(), new_value))
     sent = 0
     failed = 0
     cmd = f"no-osd add panscan {delta:+.3f}"
@@ -1780,7 +1814,7 @@ def adjust_panscan(delta):
             failed += 1
             print(f"[panscan] socket {i}: {status}", flush=True)
     sign = "+" if delta > 0 else ""
-    print(f"[panscan] {sign}{delta:.2f} -> {sent} ok, {failed} failed", flush=True)
+    print(f"[panscan] {sign}{delta:.2f} -> {sent} ok, {failed} failed | session_panscan = {session_panscan:.2f}", flush=True)
 
 
 def trigger_csp_swap():
@@ -1946,6 +1980,34 @@ def generate_grwm_script(session_dir):
         crop_filter = ""
         print("[GRWM] No crop (session_crop_width/height not set or both == 1.0)")
 
+    # ---- Panscan strategy based on final session_panscan value ----
+    # session_panscan starts at 1.0 (matching MPV's --panscan=1 default)
+    # and adjust_panscan() updates it on +/- key presses. We pick between
+    # two filter strategies based on the final value:
+    #   >= 0.5 : fill mode (force_original_aspect_ratio=increase + center
+    #            crop). Matches MPV's fill-and-crop panscan>0.5 behavior.
+    #   <  0.5 : letterbox mode (force_original_aspect_ratio=decrease +
+    #            pad). Matches MPV's letterbox panscan<0.5 behavior.
+    # Log a warning if panscan was changed mid-session — GRWM only honors
+    # the FINAL value (see TODO on session_panscan near module globals).
+    panscan_final = max(0.0, min(1.0, float(session_panscan)))
+    if session_panscan_history and len(session_panscan_history) > 0:
+        unique_vals = set(round(v, 2) for _, v in session_panscan_history)
+        if len(unique_vals) > 1:
+            print(f"[GRWM] WARN: panscan changed during session "
+                  f"({sorted(unique_vals)}). GRWM uses final value "
+                  f"{panscan_final:.2f} for the whole replay. True "
+                  f"time-varying panscan reconstruction is a future "
+                  f"improvement (see TODO).")
+    if panscan_final >= 0.5:
+        fill_mode = "increase"
+        fill_suffix = f"crop={cell_w}:{cell_h}:(iw-{cell_w})/2:(ih-{cell_h})/2"
+        print(f"[GRWM] Panscan final={panscan_final:.2f} -> fill mode (scale+crop)")
+    else:
+        fill_mode = "decrease"
+        fill_suffix = f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+        print(f"[GRWM] Panscan final={panscan_final:.2f} -> letterbox mode (scale+pad)")
+
     # ---- Build inputs list and filter graph ----
     # Each scene becomes ONE -i with input-side -ss / -t, so ffmpeg seeks
     # via the container index to the nearest keyframe before the requested
@@ -1983,29 +2045,53 @@ def generate_grwm_script(session_dir):
             in_lbl = f"[{input_idx}:v]"
             scene_lbl = f"[s{input_idx}]"
             # Per-scene chain:
-            #  1. Session crop (matches live MPV) — if cw/ch < 1.0
+            #  1. Session crop (matches live MPV's lavfi crop) — if cw/ch < 1.0
             #  2. setpts reset (each input has its own timebase post-seek)
-            #  3. scale-to-fit inside the cell, keeping aspect
-            #  4. letterbox-pad to fill the cell exactly
+            #  3. scale with fill_mode from session_panscan (increase=fill,
+            #     decrease=letterbox)
+            #  4. fill_suffix: center crop (fill mode) or center pad
+            #     (letterbox mode), matching MPV's panscan behavior
             filter_lines.append(
                 f"{in_lbl}{crop_filter}setpts=PTS-STARTPTS,"
-                f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
-                f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                f"scale={cell_w}:{cell_h}:force_original_aspect_ratio={fill_mode},"
+                f"{fill_suffix}"
                 f"{scene_lbl}"
             )
             per_scene_labels.append(scene_lbl)
             input_idx += 1
 
-        cell_lbl = f"[cell{socket_idx}]"
+        raw_cell_lbl = f"[cellraw{socket_idx}]"
         if len(per_scene_labels) == 1:
             # Avoid degenerate concat=n=1; rename the single scene's label.
             old = per_scene_labels[0]
-            filter_lines[-1] = filter_lines[-1].replace(old, cell_lbl)
+            filter_lines[-1] = filter_lines[-1].replace(old, raw_cell_lbl)
         else:
             concat_in = "".join(per_scene_labels)
             filter_lines.append(
-                f"{concat_in}concat=n={len(per_scene_labels)}:v=1:a=0{cell_lbl}"
+                f"{concat_in}concat=n={len(per_scene_labels)}:v=1:a=0{raw_cell_lbl}"
             )
+
+        # Equalize cell duration to total session duration via tpad. This
+        # fixes the "one cell freezes while the other doesn't change" bug
+        # in GRWM replays: if one cell's scene durations sum to less than
+        # the session total (e.g. because its last scene was truncated or
+        # it had fewer CSP swaps), xstack would composite it against the
+        # longer cell and the short cell would go black / freeze. Padding
+        # with tpad=stop_duration ensures every cell's concat runs for
+        # the full session length, so xstack sees uniform-duration inputs.
+        cell_total = sum(s["duration"] for s in scenes)
+        pad_needed = max(0.0, total_duration - cell_total)
+        cell_lbl = f"[cell{socket_idx}]"
+        if pad_needed > 0.05:
+            filter_lines.append(
+                f"{raw_cell_lbl}tpad=stop_duration={pad_needed:.3f}:"
+                f"stop_mode=add:color=black{cell_lbl}"
+            )
+            print(f"[GRWM] cell {socket_idx}: padding {pad_needed:.2f}s "
+                  f"(scenes={cell_total:.2f}s, session={total_duration:.2f}s)")
+        else:
+            # No padding needed — just rename raw label to cell label.
+            filter_lines[-1] = filter_lines[-1].replace(raw_cell_lbl, cell_lbl)
         cell_stream_labels.append(cell_lbl)
 
     # Keep legacy `inputs` name for downstream runner generation.
@@ -2104,6 +2190,7 @@ def generate_grwm_script(session_dir):
             f.write("    '-pix_fmt', 'yuv420p',\n")
             f.write("    '-profile:v', 'high',\n")
             f.write("    '-level', '5.1',\n")              # 5.1 supports up to 4K
+            f.write("    '-r', '30000/1001',\n")           # NTSC 29.97 to match sources
             f.write("    '-an',\n")  # no audio (grid mode)
             f.write("    OUTPUT,\n")
             f.write("]\n")
