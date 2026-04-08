@@ -1916,16 +1916,35 @@ def trigger_csp_swap():
 def generate_grwm_script(session_dir):
     """Write GRWM grid-replay artifacts to session_dir.
 
-    Recreates the actual grid the user was watching: each cell shows the
-    same scenes at the same times, scaled to a 1920x1080 output, and
-    xstacked into the same column×row grid layout the live session used.
+    Recreates the actual grid the user was watching via a 3-stage
+    pipeline (inspired by PMVCreator's tile/stack pattern, adapted for
+    our continuous panscan + NVENC use case):
+
+      Stage 1: pre-process each sub-scene to a tile mp4
+               One ffmpeg per scene (1 input, 1 NVDEC session active at
+               a time). Applies session crop + panscan + drawtext. No
+               parallelism contention.
+
+      Stage 2: per-cell concat demuxer stream-copy
+               ffmpeg -f concat -i cell_N.ffconcat -c copy cell_N.mp4
+               No re-encode. Fast.
+
+      Stage 3: xstack the cell mp4s into the final grid
+               Only N inputs (= grid cells, usually 2), trivial filter
+               chain. tpad applied per-cell if any cell is shorter than
+               the full session duration.
+
+    This architecture solves the NVDEC contention problem: the previous
+    single-pass approach opened ALL sub-scene inputs simultaneously
+    (up to 32 parallel 4K h264 decoders), overloading the GPU.
 
     Outputs:
-      grwm_filter.txt    — ffmpeg -filter_complex_script body
-      run_grwm.py        — Python runner that builds the ffmpeg arg list
-                            (sidesteps Windows cmd 8191-char limit)
-      run_grwm.bat       — thin wrapper: 'python run_grwm.py'
+      run_grwm.py              — Python runner that orchestrates the 3 stages
+      run_grwm.bat             — thin wrapper: 'python run_grwm.py'
       grwm_sequential.ffconcat — fallback simple-stitch concat file
+      tiles/                   — stage 1 intermediate tile mp4s (created at runtime)
+      cell_N.mp4               — stage 2 per-cell concatenated output (runtime)
+      grwm.mp4                 — stage 3 final grid output
 
     User runs run_grwm.bat (or run_grwm.py directly) to produce grwm.mp4.
     """
@@ -2218,209 +2237,205 @@ def generate_grwm_script(session_dir):
     label_font_path = r"C\:/Windows/Fonts/arialbd.ttf"
     label_pad = max(8, label_font_size // 3)
 
-    # ---- Build inputs list and filter graph ----
-    # Each scene becomes ONE -i with input-side -ss / -t, so ffmpeg seeks
-    # via the container index to the nearest keyframe before the requested
-    # start time. This is ~100x faster than the `trim` filter, which would
-    # force ffmpeg to decode from frame 0 of each source just to discard
-    # thousands of frames before reaching the requested start (catastrophic
-    # on 4K 51-minute sources — what looked like "CPU spinning forever"
-    # was actually the trim filter wasting all its time on upstream decodes).
-    #
-    # inputs_spec: list of (path, start_sec, duration_sec) tuples
-    inputs_spec = []
-    filter_lines = []
-    cell_stream_labels = []
-
-    input_idx = 0
+    # ---- Build SCENES list for the multi-pass runner ----
+    # Architecture: 3 stages to avoid N-parallel-NVDEC contention.
+    #  Stage 1: one ffmpeg per sub-scene -> small tile mp4 (cell-sized,
+    #           pre-cropped, pre-scaled, pre-drawtext'd). 1 NVDEC active
+    #           at a time, no parallelism stress.
+    #  Stage 2: per-cell concat demuxer stream-copies the tiles into a
+    #           single cell_N.mp4 (no re-encode, very fast).
+    #  Stage 3: simple xstack of the 2 cell mp4s into the final grid
+    #           (only 2 NVDEC sessions, trivial filter chain).
+    # Inspired by PMVCreator's tile/stack pattern but adapted: keep
+    # continuous panscan per-scene, use input-side -ss (not trim filter),
+    # use NVENC throughout.
+    SCENES = []  # list of (cell_idx, scene_idx, src_path, start, dur, panscan, stem)
+    cell_scene_total = {}  # cell_idx -> sum of scene durations
     for socket_idx in range(grid_size):
-        scenes = cell_scenes[socket_idx]
-        if not scenes:
-            # No history for this cell — emit a black source for the full
-            # session duration so the grid layout still works.
-            label = f"[cell{socket_idx}]"
-            filter_lines.append(
-                f"color=c=black:s={cell_w}x{cell_h}:d={total_duration:.3f}{label}"
-            )
-            cell_stream_labels.append(label)
-            continue
-
-        per_scene_labels = []
-        for scene in scenes:
-            inputs_spec.append((
+        scenes = cell_scenes.get(socket_idx, [])
+        cell_scene_total[socket_idx] = sum(s["duration"] for s in scenes)
+        for scene_idx, scene in enumerate(scenes):
+            stem = os.path.splitext(os.path.basename(scene["filename"]))[0]
+            SCENES.append((
+                socket_idx,
+                scene_idx,
                 _resolve_source_path(scene["filename"]),
                 scene["in_sec"],
                 scene["duration"],
+                scene.get("panscan", panscan_final),
+                stem,
             ))
-            in_lbl = f"[{input_idx}:v]"
-            scene_lbl = f"[s{input_idx}]"
-            # Per-scene continuous panscan chain
-            scene_panscan = scene.get("panscan", panscan_final)
-            panscan_chain = _panscan_filter_chain(scene_panscan)
-            # Drawtext label: filename stem, white @ 0.7, black border @ 0.55.
-            stem = os.path.splitext(os.path.basename(scene["filename"]))[0]
-            drawtext = (
-                f",drawtext=text='{stem}'"
-                f":fontfile='{label_font_path}'"
-                f":fontsize={label_font_size}"
-                f":fontcolor=white@0.7"
-                f":bordercolor=black@0.55"
-                f":borderw=2"
-                f":x={label_pad}"
-                f":y={label_pad}"
-            )
-            # Per-scene chain:
-            #  1. SAR normalization: scale=trunc(ih*dar):ih,setsar=1
-            #     Makes pixels square before subsequent filters so the
-            #     pad filter's internal dimension check doesn't get
-            #     confused by non-1:1 SAR from earlier scale operations.
-            #  2. Session crop (matches live MPV's lavfi crop) if cw/ch < 1.0
-            #  3. setpts reset (each input has its own timebase post-seek)
-            #  4. Continuous panscan chain (scale -> pad -> crop)
-            #  5. drawtext: filename stem label in top-left
-            filter_lines.append(
-                f"{in_lbl}scale=trunc(ih*dar):ih,setsar=1,"
-                f"{crop_filter}setpts=PTS-STARTPTS,"
-                f"{panscan_chain}"
-                f"{drawtext}"
-                f"{scene_lbl}"
-            )
-            per_scene_labels.append(scene_lbl)
-            input_idx += 1
 
-        raw_cell_lbl = f"[cellraw{socket_idx}]"
-        if len(per_scene_labels) == 1:
-            # Avoid degenerate concat=n=1; rename the single scene's label.
-            old = per_scene_labels[0]
-            filter_lines[-1] = filter_lines[-1].replace(old, raw_cell_lbl)
-        else:
-            concat_in = "".join(per_scene_labels)
-            filter_lines.append(
-                f"{concat_in}concat=n={len(per_scene_labels)}:v=1:a=0{raw_cell_lbl}"
-            )
-
-        # Equalize cell duration to total session duration via tpad. This
-        # fixes the "one cell freezes while the other doesn't change" bug
-        # in GRWM replays: if one cell's scene durations sum to less than
-        # the session total (e.g. because its last scene was truncated or
-        # it had fewer CSP swaps), xstack would composite it against the
-        # longer cell and the short cell would go black / freeze. Padding
-        # with tpad=stop_duration ensures every cell's concat runs for
-        # the full session length, so xstack sees uniform-duration inputs.
-        cell_total = sum(s["duration"] for s in scenes)
-        pad_needed = max(0.0, total_duration - cell_total)
-        cell_lbl = f"[cell{socket_idx}]"
+    # ---- Per-cell tail padding for stage 3 tpad equalization ----
+    cell_tail_pad = {}
+    for socket_idx in range(grid_size):
+        pad_needed = max(0.0, total_duration - cell_scene_total.get(socket_idx, 0.0))
+        cell_tail_pad[socket_idx] = pad_needed
         if pad_needed > 0.05:
-            filter_lines.append(
-                f"{raw_cell_lbl}tpad=stop_duration={pad_needed:.3f}:"
-                f"stop_mode=add:color=black{cell_lbl}"
-            )
-            print(f"[GRWM] cell {socket_idx}: padding {pad_needed:.2f}s "
-                  f"(scenes={cell_total:.2f}s, session={total_duration:.2f}s)")
-        else:
-            # No padding needed — just rename raw label to cell label.
-            filter_lines[-1] = filter_lines[-1].replace(raw_cell_lbl, cell_lbl)
-        cell_stream_labels.append(cell_lbl)
+            print(f"[GRWM] cell {socket_idx}: will tpad {pad_needed:.2f}s at stage 3 "
+                  f"(scenes={cell_scene_total[socket_idx]:.2f}s, session={total_duration:.2f}s)")
 
-    # Keep legacy `inputs` name for downstream runner generation.
-    inputs = [spec[0] for spec in inputs_spec]
-
-    # ---- xstack the cells into a grid ----
-    if grid_size == 1:
-        # Single cell — no xstack needed, rename to [out]
-        filter_lines[-1] = filter_lines[-1].replace("[cell0]", "[out]")
-    else:
-        layout_parts = []
-        for i in range(grid_size):
-            col = i % cg
-            row = i // cg
-            layout_parts.append(f"{col * cell_w}_{row * cell_h}")
-        xstack_in = "".join(cell_stream_labels)
-        filter_lines.append(
-            f"{xstack_in}xstack=inputs={grid_size}:layout={'|'.join(layout_parts)}:fill=black[out]"
-        )
-
-    # ---- Write filter script ----
-    filter_script_path = os.path.join(session_dir, "grwm_filter.txt")
-    try:
-        with open(filter_script_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(";\n".join(filter_lines))
-            f.write("\n")
-    except OSError as e:
-        print(f"[GRWM] Failed to write filter script: {e}")
-        return
-
-    # ---- Write Python runner (sidesteps cmd 8191-char limit) ----
+    # ---- Write the multi-pass Python runner ----
     runner_path = os.path.join(session_dir, "run_grwm.py")
     output_video = os.path.join(session_dir, "grwm.mp4")
+
+    # Escape font path backslashes for ffmpeg filter (fontfile='C\:/...')
+    ff_font_path = r"C\:/Windows/Fonts/arialbd.ttf"
+
     try:
         with open(runner_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("# GRWM grid replay runner\n")
+            f.write("# GRWM multi-pass grid replay runner (auto-generated)\n")
             f.write(f"# Session: {os.path.basename(session_dir)}\n")
-            f.write(f"# Grid: {cg}x{rg}, {len(inputs)} scenes, {total_duration:.1f}s total\n")
-            f.write("# NVENC H264 high quality (preset p7, cq 18)\n")
-            f.write("import subprocess, sys\n\n")
-            f.write("# (path, start_sec, duration_sec) per scene — input-side\n")
-            f.write("# seeking so ffmpeg skips prior frames via the container index.\n")
-            f.write("INPUTS = [\n")
-            for (path, start, dur) in inputs_spec:
-                f.write(f"    ({path!r}, {start:.3f}, {dur:.3f}),\n")
-            f.write("]\n\n")
-            f.write(f"FILTER_SCRIPT = {filter_script_path!r}\n")
-            f.write(f"OUTPUT = {output_video!r}\n\n")
-            f.write("cmd = ['ffmpeg', '-y', '-hide_banner']\n")
-            f.write("# Both -ss AND -t are INPUT options (placed before -i). Modern\n")
-            f.write("# ffmpeg with default -accurate_seek seeks to the exact target\n")
-            f.write("# via the container index + brief decode-and-discard (fast). -t\n")
-            f.write("# as an input option limits how much is read from THIS input.\n")
+            f.write(f"# Grid: {cg}x{rg}, {len(SCENES)} scenes, {total_duration:.1f}s total\n")
             f.write("#\n")
-            f.write("# CRITICAL: -t MUST be before -i. If placed after -i, ffmpeg\n")
-            f.write("# treats it as an OUTPUT option — and with multiple -t values\n")
-            f.write("# each subsequent -t OVERWRITES the previous one in the pending\n")
-            f.write("# output context. Result: the entire output gets truncated to\n")
-            f.write("# the LAST input's duration (seen in the wild as '8.8s session\n")
-            f.write("# but grwm.mp4 is only 2.1s and ends abruptly').\n")
-            f.write("for (p, start, dur) in INPUTS:\n")
-            f.write("    cmd += ['-hwaccel', 'cuda',\n")
-            f.write("            '-ss', f'{start:.3f}',\n")
-            f.write("            '-t', f'{dur:.3f}',\n")
-            f.write("            '-i', p]\n")
-            f.write("cmd += [\n")
-            f.write("    '-filter_complex_script', FILTER_SCRIPT,\n")
-            f.write("    '-map', '[out]',\n")
+            f.write("# Stage 1: pre-process each sub-scene to a tile mp4 (1 input each,\n")
+            f.write("#          NVDEC handles it alone, no contention with other scenes).\n")
+            f.write("# Stage 2: per-cell concat demuxer stream-copies tiles into one\n")
+            f.write("#          cell_N.mp4 per cell (no re-encode).\n")
+            f.write("# Stage 3: xstack the cell files into the final grid (only N inputs,\n")
+            f.write("#          simple filter chain). tpad applied per-cell if any cell\n")
+            f.write("#          runs shorter than session total.\n")
+            f.write("import subprocess, sys, os\n\n")
+            f.write(f"SESSION_DIR = {session_dir!r}\n")
+            f.write(f"OUTPUT      = {output_video!r}\n")
+            f.write(f"TILES_DIR   = os.path.join(SESSION_DIR, 'tiles')\n")
+            f.write(f"CELL_W, CELL_H = {cell_w}, {cell_h}\n")
+            f.write(f"OUT_W, OUT_H   = {out_w}, {out_h}\n")
+            f.write(f"COLS, ROWS     = {cg}, {rg}\n")
+            f.write(f"FPS            = '30000/1001'\n")
+            f.write(f"CW, CH         = {cw:.4f}, {ch:.4f}  # session crop factors\n")
+            f.write(f"FONT_PATH      = {ff_font_path!r}\n")
+            f.write(f"FONT_SIZE      = {label_font_size}\n")
+            f.write(f"LABEL_PAD      = {label_pad}\n")
+            f.write(f"TOTAL_DURATION = {total_duration:.3f}\n\n")
+            f.write("# Per-cell tail pad (seconds) — applied at stage 3 via tpad.\n")
+            f.write(f"CELL_TAIL_PAD  = {cell_tail_pad!r}\n\n")
+            f.write("# (cell_idx, scene_idx, src_path, start_sec, dur_sec, panscan, stem)\n")
+            f.write("SCENES = [\n")
+            for (c, i, src, start, dur, pan, stem) in SCENES:
+                f.write(f"    ({c}, {i}, {src!r}, {start:.3f}, {dur:.3f}, {pan:.3f}, {stem!r}),\n")
+            f.write("]\n\n")
+            f.write("NVENC_OPTS = [\n")
             f.write("    '-c:v', 'h264_nvenc',\n")
-            f.write("    # NVENC preset p1 = fastest. NOT slowest — the naming is\n")
-            f.write("    # inverted. p7 is slowest/highest-quality. On Ada Lovelace\n")
-            f.write("    # NVENC (RTX 40-series), p1 encodes 4K at many times\n")
-            f.write("    # realtime. To compensate for p1's weaker compression\n")
-            f.write("    # efficiency, we crank the quality knobs: low cq (15),\n")
-            f.write("    # high max bitrate, B-frames, adaptive quant, lookahead.\n")
-            f.write("    # Trade-off: larger file size vs the equivalent p7 output,\n")
-            f.write("    # but faster encode and visual quality is virtually\n")
-            f.write("    # identical for grid replay.\n")
             f.write("    '-preset', 'p1',\n")
             f.write("    '-tune', 'hq',\n")
             f.write("    '-rc', 'vbr',\n")
-            f.write("    '-cq', '15',\n")                  # very low -> very high quality
-            f.write("    '-b:v', '30M',\n")                # high target bitrate
+            f.write("    '-cq', '15',\n")
+            f.write("    '-b:v', '30M',\n")
             f.write("    '-maxrate', '60M',\n")
             f.write("    '-bufsize', '120M',\n")
-            f.write("    '-bf', '3',\n")                   # B-frames
+            f.write("    '-bf', '3',\n")
             f.write("    '-b_ref_mode', 'middle',\n")
-            f.write("    '-temporal-aq', '1',\n")          # temporal adaptive quant
-            f.write("    '-spatial-aq', '1',\n")           # spatial adaptive quant
+            f.write("    '-temporal-aq', '1',\n")
+            f.write("    '-spatial-aq', '1',\n")
             f.write("    '-rc-lookahead', '20',\n")
             f.write("    '-pix_fmt', 'yuv420p',\n")
             f.write("    '-profile:v', 'high',\n")
-            f.write("    '-level', '5.1',\n")              # 5.1 supports up to 4K
-            f.write("    '-r', '30000/1001',\n")           # NTSC 29.97 to match sources
-            f.write("    '-fps_mode', 'cfr',\n")           # force constant framerate
-            f.write("    '-an',\n")  # no audio (grid mode)
-            f.write("    OUTPUT,\n")
-            f.write("]\n")
-            f.write("print(f'Running ffmpeg with {len(INPUTS)} inputs...')\n")
-            f.write("print('First frame may take 10-30s on 4K sources — be patient, DO NOT press q.')\n")
-            f.write("sys.exit(subprocess.run(cmd).returncode)\n")
+            f.write("    '-level', '5.1',\n")
+            f.write("    '-r', FPS,\n")
+            f.write("    '-fps_mode', 'cfr',\n")
+            f.write("    '-an',\n")
+            f.write("]\n\n")
+            f.write("def build_scene_filter(panscan, stem):\n")
+            f.write("    '''Build the per-scene vf chain for stage 1.'''\n")
+            f.write("    p = max(0.0, min(1.0, panscan))\n")
+            f.write("    fit  = f'min({CELL_W}/iw,{CELL_H}/ih)'\n")
+            f.write("    fill = f'max({CELL_W}/iw,{CELL_H}/ih)'\n")
+            f.write("    factor = f'({fit}+{p:.3f}*({fill}-{fit}))'\n")
+            f.write("    crop_pre = f'crop=w=iw*{CW:.4f}:h=ih*{CH:.4f}:y=0,' if (CW < 1.0 or CH < 1.0) else ''\n")
+            f.write("    return (\n")
+            f.write("        f\"scale=trunc(ih*dar):ih,setsar=1,\"\n")
+            f.write("        f\"{crop_pre}\"\n")
+            f.write("        f\"setpts=PTS-STARTPTS,\"\n")
+            f.write("        f\"scale=w=-2:h='ih*{factor}',\"\n")
+            f.write("        f\"pad=w='max(iw\\\\,{CELL_W})':h='max(ih\\\\,{CELL_H})':x='(ow-iw)/2':y='(oh-ih)/2':color=black,\"\n")
+            f.write("        f\"crop={CELL_W}:{CELL_H}:(iw-{CELL_W})/2:(ih-{CELL_H})/2,\"\n")
+            f.write("        f\"setsar=1,\"\n")
+            f.write("        f\"drawtext=text='{stem}':fontfile='{FONT_PATH}':fontsize={FONT_SIZE}:fontcolor=white@0.7:bordercolor=black@0.55:borderw=2:x={LABEL_PAD}:y={LABEL_PAD}\"\n")
+            f.write("    )\n\n")
+            f.write("def run_cmd(tag, cmd):\n")
+            f.write("    r = subprocess.run(cmd)\n")
+            f.write("    if r.returncode != 0:\n")
+            f.write("        print(f'ERROR in {tag}: ffmpeg exit {r.returncode}', file=sys.stderr)\n")
+            f.write("        sys.exit(r.returncode)\n\n")
+            f.write("# ========== Stage 1: Pre-process each sub-scene to a tile mp4 ==========\n")
+            f.write("os.makedirs(TILES_DIR, exist_ok=True)\n")
+            f.write("tile_paths = {}  # (cell, idx) -> path\n")
+            f.write("total = len(SCENES)\n")
+            f.write("for n, (cell, idx, src, start, dur, panscan, stem) in enumerate(SCENES, 1):\n")
+            f.write("    tile_path = os.path.join(TILES_DIR, f'tile_c{cell}_s{idx:04d}.mp4')\n")
+            f.write("    vf = build_scene_filter(panscan, stem)\n")
+            f.write("    cmd = [\n")
+            f.write("        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
+            f.write("        '-hwaccel', 'cuda',\n")
+            f.write("        '-ss', f'{start:.3f}',\n")
+            f.write("        '-t', f'{dur:.3f}',\n")
+            f.write("        '-i', src,\n")
+            f.write("        '-vf', vf,\n")
+            f.write("    ] + NVENC_OPTS + [tile_path]\n")
+            f.write("    print(f'[Stage1 {n}/{total}] cell={cell} scene={idx} dur={dur:.2f}s panscan={panscan:.2f}')\n")
+            f.write("    run_cmd(f'Stage1 cell{cell} scene{idx}', cmd)\n")
+            f.write("    tile_paths[(cell, idx)] = tile_path\n\n")
+            f.write("# ========== Stage 2: Per-cell concat demuxer (stream copy) ==========\n")
+            f.write("cell_files = []\n")
+            f.write("for cell in range(COLS * ROWS):\n")
+            f.write("    cell_scenes_sorted = sorted(\n")
+            f.write("        [t for t in SCENES if t[0] == cell],\n")
+            f.write("        key=lambda x: x[1],\n")
+            f.write("    )\n")
+            f.write("    if not cell_scenes_sorted:\n")
+            f.write("        continue\n")
+            f.write("    concat_list = os.path.join(SESSION_DIR, f'cell_{cell}.ffconcat')\n")
+            f.write("    cell_file   = os.path.join(SESSION_DIR, f'cell_{cell}.mp4')\n")
+            f.write("    with open(concat_list, 'w', encoding='utf-8') as cf:\n")
+            f.write("        cf.write('ffconcat version 1.0\\n')\n")
+            f.write("        for (c, i, *_) in cell_scenes_sorted:\n")
+            f.write("            path = tile_paths[(c, i)].replace('\\\\', '/')\n")
+            f.write("            cf.write(f\"file '{path}'\\n\")\n")
+            f.write("    print(f'[Stage2] Concat cell {cell} ({len(cell_scenes_sorted)} tiles)')\n")
+            f.write("    run_cmd(\n")
+            f.write("        f'Stage2 cell {cell}',\n")
+            f.write("        [\n")
+            f.write("            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
+            f.write("            '-f', 'concat', '-safe', '0', '-i', concat_list,\n")
+            f.write("            '-c', 'copy', cell_file,\n")
+            f.write("        ],\n")
+            f.write("    )\n")
+            f.write("    cell_files.append((cell, cell_file))\n\n")
+            f.write("# ========== Stage 3: xstack cell files into final grid ==========\n")
+            f.write("stack_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'info']\n")
+            f.write("for _, cf in cell_files:\n")
+            f.write("    stack_cmd += ['-i', cf]\n")
+            f.write("# Build per-cell tpad chain if any cell is short.\n")
+            f.write("cell_inputs = []\n")
+            f.write("pre_chains = []\n")
+            f.write("for input_idx, (cell, _) in enumerate(cell_files):\n")
+            f.write("    pad_needed = CELL_TAIL_PAD.get(cell, 0.0)\n")
+            f.write("    if pad_needed > 0.05:\n")
+            f.write("        lbl = f'[p{input_idx}]'\n")
+            f.write("        pre_chains.append(f'[{input_idx}:v]tpad=stop_duration={pad_needed:.3f}:stop_mode=add:color=black{lbl}')\n")
+            f.write("        cell_inputs.append(lbl)\n")
+            f.write("    else:\n")
+            f.write("        cell_inputs.append(f'[{input_idx}:v]')\n")
+            f.write("layout_parts = []\n")
+            f.write("for i, _ in enumerate(cell_files):\n")
+            f.write("    col = i % COLS\n")
+            f.write("    row = i // COLS\n")
+            f.write("    layout_parts.append(f'{col*CELL_W}_{row*CELL_H}')\n")
+            f.write("layout = '|'.join(layout_parts)\n")
+            f.write("xstack_in = ''.join(cell_inputs)\n")
+            f.write("xstack_line = (\n")
+            f.write("    f'{xstack_in}xstack=inputs={len(cell_files)}:layout={layout}:fill=black,'\n")
+            f.write("    f'fps={FPS},setpts=PTS-STARTPTS[out]'\n")
+            f.write(")\n")
+            f.write("filter_complex = ';'.join(pre_chains + [xstack_line]) if pre_chains else xstack_line\n")
+            f.write("stack_cmd += [\n")
+            f.write("    '-filter_complex', filter_complex,\n")
+            f.write("    '-map', '[out]',\n")
+            f.write("] + NVENC_OPTS + [OUTPUT]\n")
+            f.write("print(f'[Stage3] Stacking {len(cell_files)} cells via xstack')\n")
+            f.write("run_cmd('Stage3 xstack', stack_cmd)\n")
+            f.write("print('[OK] grwm.mp4 produced')\n")
     except OSError as e:
         print(f"[GRWM] Failed to write runner: {e}")
         return
@@ -2437,7 +2452,7 @@ def generate_grwm_script(session_dir):
     try:
         with open(bat_path, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
             f.write("@echo off\r\n")
-            f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(inputs)} scenes\r\n")
+            f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(SCENES)} scenes\r\n")
             f.write("REM %~dp0 = this bat file's own dir, handles unicode paths correctly\r\n")
             f.write("python \"%~dp0run_grwm.py\"\r\n")
             f.write("pause\r\n")
@@ -2473,8 +2488,7 @@ def generate_grwm_script(session_dir):
     except OSError as e:
         print(f"[GRWM] Failed to write sequential fallback: {e}")
 
-    print(f"[GRWM] Grid replay: {cg}x{rg} grid, {len(inputs)} scenes, {total_duration:.1f}s")
-    print(f"[GRWM]   Filter: {filter_script_path}")
+    print(f"[GRWM] Grid replay: {cg}x{rg} grid, {len(SCENES)} scenes, {total_duration:.1f}s")
     print(f"[GRWM]   Runner: {bat_path} (or run_grwm.py)")
     print(f"[GRWM]   Sequential fallback: {seq_concat_path}")
 
