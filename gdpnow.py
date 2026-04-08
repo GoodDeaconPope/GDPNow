@@ -1183,10 +1183,13 @@ cell_history = []
 # Set when E key is pressed; cycle thread checks this and stops switching.
 e_locked = threading.Event()
 
-# Snapshot of the live crop factors, captured at play_videos() start so
-# GRWM can match what was actually on screen during the session.
+# Snapshot of the live crop factors + output dimensions, captured at
+# play_videos() start so GRWM can match what was actually on screen
+# during the session (including portrait orientation after monitor rot).
 session_crop_width = None
 session_crop_height = None
+session_output_w = None
+session_output_h = None
 
 # +/- panscan adjustment step (MPV panscan property range is [0.0, 1.0])
 PANSCAN_STEP = 0.05
@@ -1676,9 +1679,16 @@ def generate_grwm_script(session_dir):
         cell_scenes[socket_idx] = scenes
 
     # ---- Output dimensions ----
-    out_w, out_h = 1920, 1080
+    # Match the live session resolution (respects portrait/rotated setups).
+    # Falls back to 1920x1080 only if the session globals were never set.
+    if session_output_w and session_output_h:
+        out_w = session_output_w - (session_output_w % 2)
+        out_h = session_output_h - (session_output_h % 2)
+    else:
+        out_w, out_h = 1920, 1080
     cell_w = (out_w // cg) - ((out_w // cg) % 2)  # even
     cell_h = (out_h // rg) - ((out_h // rg) % 2)  # even
+    print(f"[GRWM] Output: {out_w}x{out_h}, cell: {cell_w}x{cell_h}")
 
     # ---- Crop factors matching the live session ----
     # play_videos snapshots config.crop_width/crop_height into these globals
@@ -1831,16 +1841,30 @@ def generate_grwm_script(session_dir):
             f.write("    '-filter_complex_script', FILTER_SCRIPT,\n")
             f.write("    '-map', '[out]',\n")
             f.write("    '-c:v', 'h264_nvenc',\n")
-            f.write("    '-preset', 'p7',\n")
+            f.write("    # NVENC preset p1 = fastest. NOT slowest — the naming is\n")
+            f.write("    # inverted. p7 is slowest/highest-quality. On Ada Lovelace\n")
+            f.write("    # NVENC (RTX 40-series), p1 encodes 4K at many times\n")
+            f.write("    # realtime. To compensate for p1's weaker compression\n")
+            f.write("    # efficiency, we crank the quality knobs: low cq (15),\n")
+            f.write("    # high max bitrate, B-frames, adaptive quant, lookahead.\n")
+            f.write("    # Trade-off: larger file size vs the equivalent p7 output,\n")
+            f.write("    # but faster encode and visual quality is virtually\n")
+            f.write("    # identical for grid replay.\n")
+            f.write("    '-preset', 'p1',\n")
             f.write("    '-tune', 'hq',\n")
             f.write("    '-rc', 'vbr',\n")
-            f.write("    '-cq', '18',\n")
-            f.write("    '-b:v', '20M',\n")
-            f.write("    '-maxrate', '40M',\n")
-            f.write("    '-bufsize', '60M',\n")
+            f.write("    '-cq', '15',\n")                  # very low -> very high quality
+            f.write("    '-b:v', '30M',\n")                # high target bitrate
+            f.write("    '-maxrate', '60M',\n")
+            f.write("    '-bufsize', '120M',\n")
+            f.write("    '-bf', '3',\n")                   # B-frames
+            f.write("    '-b_ref_mode', 'middle',\n")
+            f.write("    '-temporal-aq', '1',\n")          # temporal adaptive quant
+            f.write("    '-spatial-aq', '1',\n")           # spatial adaptive quant
+            f.write("    '-rc-lookahead', '20',\n")
             f.write("    '-pix_fmt', 'yuv420p',\n")
             f.write("    '-profile:v', 'high',\n")
-            f.write("    '-level', '4.2',\n")
+            f.write("    '-level', '5.1',\n")              # 5.1 supports up to 4K
             f.write("    '-an',\n")  # no audio (grid mode)
             f.write("    OUTPUT,\n")
             f.write("]\n")
@@ -1909,10 +1933,19 @@ def play_videos(config, video_list):
     """Starts MPV instances based on config and video list, prepares for cycling."""
     global sockets, processes, person_socket_map, interrupt_event
     global session_crop_width, session_crop_height
+    global session_output_w, session_output_h
 
     # Snapshot the live crop factors so GRWM can reproduce the same view.
     session_crop_width = float(config.crop_width) if config.crop_width else 0.0
     session_crop_height = float(config.crop_height) if config.crop_height else 0.0
+    # Snapshot the actual monitor/session dimensions so GRWM output matches
+    # the real resolution (important for portrait/rotated setups).
+    try:
+        session_output_w = int(config.input_geometry[0])
+        session_output_h = int(config.input_geometry[1])
+    except Exception:
+        session_output_w = None
+        session_output_h = None
 
     # --- Reset global state ---
     print("Initializing playback...")
