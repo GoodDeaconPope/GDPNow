@@ -2,10 +2,19 @@ import tkinter as tk
 import shlex
 import shutil
 import subprocess
+import sys as _sys
 import tempfile
 import time
 import math
 import random
+
+# Reconfigure stdout/stderr to UTF-8 so prints containing non-ASCII chars
+# (e.g. U+A789 "꞉" in session IDs) don't crash on legacy cp1252 consoles.
+try:
+    _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 from PIL import ImageGrab
 # import screenGeo ...
 import sys
@@ -1182,11 +1191,17 @@ class NutCounter:
     @staticmethod
     def _make_session_id():
         """Human-readable session ID for the folder name.
-        Format: "4.21 AM, April 8th 2026"  (colon replaced with '.' — Windows
-        filesystem forbids ':' in paths)."""
+        Format: "4꞉21 AM, April 8th 2026"
+
+        NTFS forbids ASCII ':' in path components (it's reserved for
+        Alternate Data Streams), so the hour/minute separator uses
+        U+A789 MODIFIER LETTER COLON '꞉' which is in Unicode
+        specifically for displaying colons where ':' is unavailable.
+        It renders nearly identically to ':' in most fonts."""
         now = datetime.datetime.now()
-        # 12-hour time; lstrip leading zero on hour ("04" -> "4")
-        time_str = now.strftime("%I.%M %p").lstrip("0")
+        hour_12 = now.hour % 12 or 12
+        ampm = "AM" if now.hour < 12 else "PM"
+        time_str = f"{hour_12}\uA789{now.minute:02d} {ampm}"
         day = now.day
         if 10 <= day % 100 <= 20:
             suffix = "th"
