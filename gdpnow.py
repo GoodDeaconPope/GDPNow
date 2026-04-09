@@ -2738,15 +2738,16 @@ def generate_grwm_script(session_dir):
             f.write("        f\"scale=trunc(ih*dar):ih,setsar=1,\"\n")
             f.write("        f\"{crop_pre}\"\n")
             f.write("        f\"setpts=PTS-STARTPTS,\"\n")
-            f.write("        f\"scale=w=-2:h='ih*{factor}',\"\n")
-            # Re-normalize SAR after the panscan-interpolation scale. With
-            # scale=w=-2:h='expr' ffmpeg derives w from h with even-round,
-            # which keeps SAR CLOSE to 1:1 but not EXACTLY. At panscan
-            # values near fit (where scaled dims ~= cell dims) that tiny
-            # drift makes pad's display-adjusted dimension check reject
-            # with 'Padded dimensions cannot be smaller than input
-            # dimensions'. Cheap setsar=1 here forces SAR back to 1:1
-            # before pad does its size check.
+            # Force the panscan scale's h to an EVEN INTEGER via
+            # trunc(expr/2)*2. Without this, the expression result is a
+            # float internally and pad's downstream config-time dimension
+            # check rejects with 'Padded dimensions cannot be smaller than
+            # input dimensions' on certain panscan values where the
+            # fractional h confuses the upstream link metadata. Setting
+            # SAR to 1:1 alone is NOT enough — verified by isolating the
+            # repro on 321.mp4 at panscan=0.85 in /tmp this turn. The
+            # trunc-to-even wrapper makes ALL panscan values [0,1] work.
+            f.write("        f\"scale=w=-2:h='trunc(ih*{factor}/2)*2',\"\n")
             f.write("        f\"setsar=1,\"\n")
             f.write("        f\"pad=w='max(iw\\\\,{CELL_W})':h='max(ih\\\\,{CELL_H})':x='(ow-iw)/2':y='(oh-ih)/2':color=black,\"\n")
             f.write("        f\"crop={CELL_W}:{CELL_H}:'{x_expr}':'{y_expr}',\"\n")
