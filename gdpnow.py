@@ -1386,25 +1386,35 @@ session_video_pan_history = []  # list of (wall_time, x, y)
 # This is the *per-tap* step when the key is briefly pressed and released
 # (single discrete movement). Held-down arrow keys use a separate smooth
 # animation thread (see _pan_animator below) with a smaller per-tick delta
-# so motion looks fluid instead of jerky jumps. Tuned down from 0.03
-# because even a single quick tap was moving the image too much — the
-# user wants subtle framing tweaks, not full-scene jumps.
-VIDEO_PAN_STEP = 0.015
+# so motion looks fluid instead of jerky jumps. Tuned down repeatedly
+# because each tap was moving the image too much — the user wants
+# subtle framing tweaks, not full-scene jumps.
+VIDEO_PAN_STEP = 0.008
 
 # Smooth-pan animation constants. While any arrow key is held, a single
 # background thread ticks at PAN_TICK_HZ and emits PAN_TICK_STEP-sized
-# deltas for each held direction. Rate math: 33Hz * 0.007 = ~23%/sec held
-# pan, so the full [-1, 1] range takes ~8.5s of sustained hold — slow
-# enough to land on a specific spot without overshooting, and matched to
-# the smaller per-tap step so holding feels like repeated taps not a
-# runaway slider.
+# deltas for each held direction. Rate math: 33Hz * 0.003 = ~10%/sec
+# held pan, so the full [-1, 1] range takes ~20s of sustained hold —
+# slow enough for precise framing, you'll reach for hold-down rather
+# than rapid tapping if you need to move far.
 PAN_TICK_HZ = 33
-PAN_TICK_STEP = 0.007
+PAN_TICK_STEP = 0.003
 
 # Held-state + animator thread globals (see _pan_key_down / _pan_animator)
 _pan_held = {("x", +1): False, ("x", -1): False, ("y", +1): False, ("y", -1): False}
 _pan_thread = None
 _pan_thread_lock = threading.Lock()
+
+# Whether arrow-key video-pan is meaningful this session. Only True for
+# landscape grids (rows < cols) where main() forced calc_w=1.0 so the
+# source overflows the cell horizontally. In square/portrait grids the
+# pre-fit formula makes post-crop aspect EXACTLY match cell aspect
+# (fit_scale == fill_scale), so video-pan-x would just push the video
+# into black margin instead of revealing more scene. Arrow keys are
+# gated on this flag in on_press / on_release; pressing them in a
+# non-landscape grid prints a one-line explanation instead of moving
+# cells into black. Set by main() at config-finalize time.
+_arrow_pan_enabled = False
 
 
 def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
@@ -3566,8 +3576,12 @@ def on_press(key):
                 # to walk manually back to center.
                 _run_async(reset_video_pan, name="VPanReset")
                 return
-        # Arrow keys: smooth continuous pan via the animator thread. We
-        # send ONE immediate tap-sized delta on the first press (for
+        # Arrow keys: smooth continuous pan via the animator thread. Only
+        # active in landscape grids (row < col) where the source actually
+        # overflows the cell — otherwise arrow keys would just push the
+        # video into black margin. See _arrow_pan_enabled comment above.
+        #
+        # We send ONE immediate tap-sized delta on the first press (for
         # instant feedback on quick taps), then mark the direction held
         # so _pan_animator takes over at PAN_TICK_HZ until release.
         #
@@ -3575,26 +3589,37 @@ def on_press(key):
         # -> see more of the LEFT source. MPV's video-pan-x positive
         # shifts the image RIGHT in the cell, which visually reveals
         # LEFT source content, so arrow-left -> positive video-pan-x.
-        if key == Key.left:
-            if not _pan_held[("x", +1)]:
-                _run_async(adjust_video_pan_x, VIDEO_PAN_STEP, name="VPanLeftTap")
-            _pan_key_down("x", +1)
-            return
-        if key == Key.right:
-            if not _pan_held[("x", -1)]:
-                _run_async(adjust_video_pan_x, -VIDEO_PAN_STEP, name="VPanRightTap")
-            _pan_key_down("x", -1)
-            return
-        if key == Key.up:
-            if not _pan_held[("y", +1)]:
-                _run_async(adjust_video_pan_y, VIDEO_PAN_STEP, name="VPanUpTap")
-            _pan_key_down("y", +1)
-            return
-        if key == Key.down:
-            if not _pan_held[("y", -1)]:
-                _run_async(adjust_video_pan_y, -VIDEO_PAN_STEP, name="VPanDownTap")
-            _pan_key_down("y", -1)
-            return
+        if key in (Key.left, Key.right, Key.up, Key.down):
+            if not _arrow_pan_enabled:
+                # One-shot log so we don't spam on OS key-repeat.
+                if not getattr(on_press, "_pan_disabled_logged", False):
+                    print(
+                        "[video-pan] Arrow keys disabled: only landscape "
+                        "grids (rows<cols) have meaningful pan range.",
+                        flush=True,
+                    )
+                    on_press._pan_disabled_logged = True
+                return
+            if key == Key.left:
+                if not _pan_held[("x", +1)]:
+                    _run_async(adjust_video_pan_x, VIDEO_PAN_STEP, name="VPanLeftTap")
+                _pan_key_down("x", +1)
+                return
+            if key == Key.right:
+                if not _pan_held[("x", -1)]:
+                    _run_async(adjust_video_pan_x, -VIDEO_PAN_STEP, name="VPanRightTap")
+                _pan_key_down("x", -1)
+                return
+            if key == Key.up:
+                if not _pan_held[("y", +1)]:
+                    _run_async(adjust_video_pan_y, VIDEO_PAN_STEP, name="VPanUpTap")
+                _pan_key_down("y", +1)
+                return
+            if key == Key.down:
+                if not _pan_held[("y", -1)]:
+                    _run_async(adjust_video_pan_y, -VIDEO_PAN_STEP, name="VPanDownTap")
+                _pan_key_down("y", -1)
+                return
         if key == Key.esc:
             should_quit = True
 
@@ -3617,7 +3642,11 @@ def on_press(key):
 def on_release(key):
     """Keyboard release handler. Shutdown logic stays in on_press; this
     handler only clears the held-state flags for the arrow-key smooth-pan
-    animator so the animator thread exits when the user lets go."""
+    animator so the animator thread exits when the user lets go.
+
+    Safe to call unconditionally even when _arrow_pan_enabled is False —
+    the held flags would be False anyway (on_press gated the keydown),
+    and _pan_key_up is a cheap no-op in that case."""
     try:
         if key == Key.left:
             _pan_key_up("x", +1)
@@ -3805,6 +3834,12 @@ def main():
         # landscape grids we keep the full source width (calc_w=1.0) and rely on
         # the new arrow-key video-pan-x / video-pan-y bindings to scroll through
         # the oversized frame. Portrait grids already clamped to 1.0 naturally.
+        #
+        # This is also the one place where arrow-key video-pan is actually
+        # meaningful — in any other grid type, post-crop aspect matches cell
+        # aspect exactly, fit_scale == fill_scale, and video-pan-x just pushes
+        # the video into black margin. So we also flip _arrow_pan_enabled here.
+        global _arrow_pan_enabled
         if row_grid > 0 and column_grid > 0 and row_grid < column_grid:
             print(
                 f"Landscape grid {column_grid}x{row_grid}: overriding "
@@ -3812,6 +3847,9 @@ def main():
                 f"(use arrow keys to pan the camera within each cell)."
             )
             calculated_value = 1.0
+            _arrow_pan_enabled = True
+        else:
+            _arrow_pan_enabled = False
 
         # Set final crop_width based on master_type, using calculated value as fallback/default for most
         config.crop_width = {
