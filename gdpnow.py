@@ -2159,10 +2159,39 @@ def _arrow_pan_meaningful():
         return False
 
 
+def _csp_start_sec_for(socket_idx, filename):
+    """Look up CSP start time (with pre-roll) for a given (socket, video)
+    from person_socket_map's metadata. Returns the start-second the
+    'loadfile start=...' command should use, or None if the video has no
+    CSP marker. Used both by the one-shot trigger_csp_swap and by the
+    cycle thread's CSP-mode rotation."""
+    try:
+        for entry in person_socket_map.get(socket_idx, []):
+            if filename in entry:
+                meta = entry[filename] or {}
+                csp_str = meta.get("CSP")
+                if not csp_str:
+                    return None
+                csp_sec = mmss_to_seconds(csp_str)
+                return max(0, csp_sec - CSP_PRE_ROLL_SEC)
+    except Exception:
+        return None
+    return None
+
+
 def trigger_csp_swap():
-    """E key handler: for every active cell, send a loadfile swapping to
-    that video's CSP position (with a small pre-roll), then engage
-    e_locked so the cycle thread stops further switching.
+    """E key handler: for every active cell, send an immediate loadfile to
+    that cell's CURRENT video's CSP position (with a small pre-roll), then
+    engage e_locked. Once e_locked is set, the cycle thread switches into
+    CSP-rotation mode instead of halting — on each subsequent cycle tick it
+    advances through the cell's remaining videos (round-robin), loading
+    each video's CSP scene in turn. Cells whose current/next videos lack a
+    CSP marker are simply skipped on that tick.
+
+    This way, a cell that was originally cycling between persons A/B/C
+    continues to cycle after E, but always landing on the CSP moment of
+    whichever person is up. Before this change, E froze each cell on its
+    ONE current video's CSP and never moved off it.
 
     Uses _send_fresh() (fresh short-lived pipe handles with a 2s timeout)
     instead of the persistent MpvIpcClient, so a stuck WriteFile on the
@@ -2195,23 +2224,16 @@ def trigger_csp_swap():
             skipped += 1
             continue
 
+        filename = info["filename"]
         meta = info.get("metadata") or {}
         csp_str = meta.get("CSP")
         print(f"  Socket {socket_idx}: meta keys={list(meta.keys())}, CSP={csp_str!r}", flush=True)
-        if not csp_str:
-            print(f"  Socket {socket_idx}: no CSP in metadata for {info['filename']}, skipping.", flush=True)
+        start_sec = _csp_start_sec_for(socket_idx, filename)
+        if start_sec is None:
+            print(f"  Socket {socket_idx}: no CSP in metadata for {filename}, skipping.", flush=True)
             skipped += 1
             continue
-        try:
-            csp_sec = mmss_to_seconds(csp_str)
-        except Exception as e:
-            print(f"  Socket {socket_idx}: bad CSP value {csp_str!r} ({e}), skipping.", flush=True)
-            skipped += 1
-            continue
-
-        start_sec = max(0, csp_sec - CSP_PRE_ROLL_SEC)
         start_str = seconds_to_mmss(start_sec)
-        filename = info["filename"]
         cmd = f'loadfile {filename} replace "start={start_str}"'
         pipe_name = _pipe_name_for(socket_idx)
 
@@ -2232,8 +2254,9 @@ def trigger_csp_swap():
             skipped += 1
 
     e_locked.set()
-    print(f"[E] Swapped {swapped}, skipped {skipped}. Cycling locked on CSP.", flush=True)
-    print("[E] Press Q or ESC to finalize the session.", flush=True)
+    print(f"[E] Swapped {swapped}, skipped {skipped}. CSP-cycle mode ENGAGED.", flush=True)
+    print("[E] Cycle thread will continue rotating through each cell's videos,", flush=True)
+    print("[E] loading CSP scenes on every tick. Press Q or ESC to finalize.", flush=True)
 
 
 def generate_grwm_script(session_dir):
@@ -3399,10 +3422,13 @@ def cycle_videos(config):
         wall_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"--- Cycle Switch {switch_idx}/{num_switches} at ~{wall_ts} ---")
 
-        # E key was pressed — hold everyone on CSP, skip this switch.
-        if e_locked.is_set():
-            print(f"Cycle Thread: e_locked engaged, holding on CSP (switch {switch_idx} skipped).")
-            continue
+        # E key was pressed — CSP-cycle mode: keep advancing through the
+        # per-socket video rotation on each tick, but load each video's
+        # CSP position instead of a scheduled RR offset. If a given video
+        # lacks a CSP marker, skip that cell's swap for this tick.
+        csp_mode = e_locked.is_set()
+        if csp_mode:
+            print(f"Cycle Thread: e_locked engaged, CSP-cycling (switch {switch_idx}).")
 
         for socket_idx in active_socket_indices:
             if socket_idx in dead_sockets:
@@ -3420,29 +3446,45 @@ def cycle_videos(config):
             vid_idx = switch_idx % n
             v = vids[vid_idx]
 
-            key = (socket_idx, vid_idx)
-            offsets = segment_offsets.get(key, [0])
-            occ_limit = approx_occurrences.get(key, len(offsets))
+            if csp_mode:
+                csp_start = _csp_start_sec_for(socket_idx, v["filename"])
+                if csp_start is None:
+                    # No CSP for this video — leave the cell on whatever
+                    # it was last showing (don't swap on this tick).
+                    print(
+                        f"    Socket {socket_idx}: no CSP for '{v['filename']}', "
+                        f"holding on current video (CSP-cycle).",
+                        flush=True,
+                    )
+                    continue
+                final_start_sec = csp_start
+                final_start_str = seconds_to_mmss(csp_start)
+                debug_info = f"CSP @ {final_start_str} (-{CSP_PRE_ROLL_SEC}s pre-roll)"
+            else:
+                key = (socket_idx, vid_idx)
+                offsets = segment_offsets.get(key, [0])
+                occ_limit = approx_occurrences.get(key, len(offsets))
 
-            used_so_far = usage_counts.get(key, 0)
-            occ_index = used_so_far
-            if occ_index >= len(offsets):
-                occ_index = len(offsets) - 1  # clamp
+                used_so_far = usage_counts.get(key, 0)
+                occ_index = used_so_far
+                if occ_index >= len(offsets):
+                    occ_index = len(offsets) - 1  # clamp
 
-            offset_in_window = offsets[occ_index]
-            final_start_sec = v["base_sec"] + offset_in_window
-            final_start_str = seconds_to_mmss(final_start_sec)
+                offset_in_window = offsets[occ_index]
+                final_start_sec = v["base_sec"] + offset_in_window
+                final_start_str = seconds_to_mmss(final_start_sec)
 
-            # bump usage counter
-            usage_counts[key] = used_so_far + 1
+                # bump usage counter
+                usage_counts[key] = used_so_far + 1
 
-            debug_info = (
-                f"video_time={v['video_time']}s, approx_occ={occ_limit}, "
-                f"offset={offset_in_window}s, occ_index={occ_index}"
-            )
+                debug_info = (
+                    f"video_time={v['video_time']}s, approx_occ={occ_limit}, "
+                    f"offset={offset_in_window}s, occ_index={occ_index}"
+                )
+
             print(
                 f"    Socket {socket_idx}: load '{v['filename']}' at {final_start_str} "
-                f"(RR segment: {debug_info})"
+                f"({'CSP-cycle' if csp_mode else 'RR segment'}: {debug_info})"
             )
 
             cmd = f'loadfile {v["filename"]} replace "start={final_start_str}"'
