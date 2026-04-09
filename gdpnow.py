@@ -1405,16 +1405,28 @@ _pan_held = {("x", +1): False, ("x", -1): False, ("y", +1): False, ("y", -1): Fa
 _pan_thread = None
 _pan_thread_lock = threading.Lock()
 
-# Whether arrow-key video-pan is meaningful this session. Only True for
-# landscape grids (rows < cols) where main() forced calc_w=1.0 so the
-# source overflows the cell horizontally. In square/portrait grids the
-# pre-fit formula makes post-crop aspect EXACTLY match cell aspect
-# (fit_scale == fill_scale), so video-pan-x would just push the video
-# into black margin instead of revealing more scene. Arrow keys are
-# gated on this flag in on_press / on_release; pressing them in a
-# non-landscape grid prints a one-line explanation instead of moving
-# cells into black. Set by main() at config-finalize time.
-_arrow_pan_enabled = False
+# Arrow-key video-pan gating is DYNAMIC based on the current GridHost
+# client aspect, not a static session-level flag, because the user can
+# resize the GridHost at runtime and make pan go from useless to useful
+# (or vice versa). Arrow keys only do something visible when the video
+# overflows the cell in at least one direction, which requires
+# post-crop aspect != current cell aspect.
+#
+# _pan_ref_cell_aspect is the cell aspect at which post-crop aspect
+# matches exactly (the "pan is a no-op" aspect). Set in main() at
+# config-finalize time:
+#   - Landscape override active (row<col, calc_w=1.0 forced):
+#     post-crop aspect = source_aspect / crop_h, which we CANNOT compute
+#     without ffprobing the source. Pan is ALWAYS meaningful in that
+#     case because calc_w=1.0 never matches cell aspect exactly (except
+#     by coincidence). Sentinel value: None -> "always meaningful".
+#   - Otherwise: the prefit calc_w formula makes post-crop aspect equal
+#     to the INITIAL cell aspect. Store that initial aspect and compare
+#     at press time against the current (post-resize) cell aspect. A
+#     resize that changes the aspect means pan now has range.
+_pan_ref_cell_aspect = None
+# Throttle for the "pan disabled" log line so OS key-repeat doesn't spam.
+_pan_disabled_log_ts = 0.0
 
 
 def _update_cell_state(socket_idx, filename, started_pos_sec, metadata=None):
@@ -2102,6 +2114,51 @@ def _pan_key_up(axis, sign):
         _pan_held[(axis, sign)] = False
 
 
+def _arrow_pan_meaningful():
+    """Return True if arrow keys would visibly pan the video given the
+    CURRENT GridHost client area. Called at every keydown so a mid-session
+    resize toggles the gate automatically.
+
+    Regime 1: _pan_ref_cell_aspect is None (landscape override applied)
+       Always True — calc_w=1.0 means post-crop aspect is source-derived
+       and never matches cell aspect exactly.
+
+    Regime 2: _pan_ref_cell_aspect is a float (prefit formula applied)
+       Read the current host client rect, compute current cell aspect,
+       compare to the reference. If they differ by more than 2% the user
+       has resized non-proportionally and pan is now useful. If they
+       match, pan is useless (post-crop is cell-sized -> pan pushes into
+       black margin) and we block.
+
+    Regime 3: no reference set yet OR no GridHost yet -> False, block.
+    """
+    if _pan_ref_cell_aspect is None:
+        return True  # landscape sentinel: always on
+    try:
+        import win32gui
+        if not _GRID_HOST_STATE:
+            return False
+        host_hwnd = next(iter(_GRID_HOST_STATE))
+        state = _GRID_HOST_STATE[host_hwnd]
+        cfg = state.get("config")
+        if cfg is None:
+            return False
+        rect = win32gui.GetClientRect(host_hwnd)
+        host_w = rect[2] - rect[0]
+        host_h = rect[3] - rect[1]
+        cols = max(1, int(cfg.column_grid))
+        rows = max(1, int(cfg.row_grid))
+        if host_w <= 0 or host_h <= 0:
+            return False
+        curr_aspect = (host_w / cols) / (host_h / rows)
+        # 2% threshold: tighter than this and cells are within 10 pixels
+        # of matching which is essentially "no visible pan range".
+        return abs(curr_aspect - _pan_ref_cell_aspect) > 0.02
+    except Exception as e:
+        print(f"[pan-check] {e}", flush=True)
+        return False
+
+
 def trigger_csp_swap():
     """E key handler: for every active cell, send a loadfile swapping to
     that video's CSP position (with a small pre-roll), then engage
@@ -2659,6 +2716,15 @@ def generate_grwm_script(session_dir):
             f.write("        f\"{crop_pre}\"\n")
             f.write("        f\"setpts=PTS-STARTPTS,\"\n")
             f.write("        f\"scale=w=-2:h='ih*{factor}',\"\n")
+            # Re-normalize SAR after the panscan-interpolation scale. With
+            # scale=w=-2:h='expr' ffmpeg derives w from h with even-round,
+            # which keeps SAR CLOSE to 1:1 but not EXACTLY. At panscan
+            # values near fit (where scaled dims ~= cell dims) that tiny
+            # drift makes pad's display-adjusted dimension check reject
+            # with 'Padded dimensions cannot be smaller than input
+            # dimensions'. Cheap setsar=1 here forces SAR back to 1:1
+            # before pad does its size check.
+            f.write("        f\"setsar=1,\"\n")
             f.write("        f\"pad=w='max(iw\\\\,{CELL_W})':h='max(ih\\\\,{CELL_H})':x='(ow-iw)/2':y='(oh-ih)/2':color=black,\"\n")
             f.write("        f\"crop={CELL_W}:{CELL_H}:'{x_expr}':'{y_expr}',\"\n")
             f.write("        f\"setsar=1,\"\n")
@@ -3576,10 +3642,17 @@ def on_press(key):
                 # to walk manually back to center.
                 _run_async(reset_video_pan, name="VPanReset")
                 return
-        # Arrow keys: smooth continuous pan via the animator thread. Only
-        # active in landscape grids (row < col) where the source actually
-        # overflows the cell — otherwise arrow keys would just push the
-        # video into black margin. See _arrow_pan_enabled comment above.
+        # Arrow keys: smooth continuous pan via the animator thread. Gated
+        # DYNAMICALLY on _arrow_pan_meaningful() which re-checks the current
+        # GridHost client rect vs the reference aspect at EVERY keydown. This
+        # means:
+        #   - Landscape grids (row<col): always enabled.
+        #   - Non-landscape grids at their original monitor size: disabled
+        #     (post-crop aspect matches cell aspect, pan pushes into black).
+        #   - Non-landscape grids AFTER the user resizes the GridHost
+        #     non-proportionally (e.g. drag a 2x2 into a 960x1080 portrait
+        #     frame): ENABLED, because cell aspect diverges from the baked-
+        #     in post-crop aspect and pan now has real range.
         #
         # We send ONE immediate tap-sized delta on the first press (for
         # instant feedback on quick taps), then mark the direction held
@@ -3590,15 +3663,18 @@ def on_press(key):
         # shifts the image RIGHT in the cell, which visually reveals
         # LEFT source content, so arrow-left -> positive video-pan-x.
         if key in (Key.left, Key.right, Key.up, Key.down):
-            if not _arrow_pan_enabled:
-                # One-shot log so we don't spam on OS key-repeat.
-                if not getattr(on_press, "_pan_disabled_logged", False):
+            if not _arrow_pan_meaningful():
+                # Throttle log to once per second so OS key-repeat doesn't
+                # spam the console while the user holds an arrow.
+                global _pan_disabled_log_ts
+                now = time.time()
+                if now - _pan_disabled_log_ts > 1.0:
+                    _pan_disabled_log_ts = now
                     print(
-                        "[video-pan] Arrow keys disabled: only landscape "
-                        "grids (rows<cols) have meaningful pan range.",
+                        "[video-pan] Arrow keys disabled at current aspect: "
+                        "resize GridHost non-proportionally to unlock pan range.",
                         flush=True,
                     )
-                    on_press._pan_disabled_logged = True
                 return
             if key == Key.left:
                 if not _pan_held[("x", +1)]:
@@ -3832,14 +3908,19 @@ def main():
         # so post-crop aspect matches cell aspect, which collapses panscan range
         # to zero on 2x1 (and generally destroys up to ~56% of width). For
         # landscape grids we keep the full source width (calc_w=1.0) and rely on
-        # the new arrow-key video-pan-x / video-pan-y bindings to scroll through
+        # the arrow-key video-pan-x / video-pan-y bindings to scroll through
         # the oversized frame. Portrait grids already clamped to 1.0 naturally.
         #
-        # This is also the one place where arrow-key video-pan is actually
-        # meaningful — in any other grid type, post-crop aspect matches cell
-        # aspect exactly, fit_scale == fill_scale, and video-pan-x just pushes
-        # the video into black margin. So we also flip _arrow_pan_enabled here.
-        global _arrow_pan_enabled
+        # Also configures the reference cell aspect used by _arrow_pan_meaningful()
+        # at runtime. Two regimes:
+        #   - Landscape override on: post-crop aspect is source-dependent and
+        #     NEVER matches cell aspect (except by coincidence). Arrow keys
+        #     always produce visible movement. Sentinel: None = always on.
+        #   - Prefit formula on: post-crop aspect == INITIAL cell aspect BY
+        #     DESIGN. If the user later resizes the GridHost non-proportionally,
+        #     current cell aspect diverges and arrow keys become meaningful.
+        #     Store the initial aspect for later comparison.
+        global _pan_ref_cell_aspect
         if row_grid > 0 and column_grid > 0 and row_grid < column_grid:
             print(
                 f"Landscape grid {column_grid}x{row_grid}: overriding "
@@ -3847,9 +3928,16 @@ def main():
                 f"(use arrow keys to pan the camera within each cell)."
             )
             calculated_value = 1.0
-            _arrow_pan_enabled = True
+            _pan_ref_cell_aspect = None  # sentinel: always meaningful
         else:
-            _arrow_pan_enabled = False
+            # Compute initial cell aspect: (mon_w/cols) / (mon_h/rows)
+            try:
+                _pan_ref_cell_aspect = (
+                    (float(input_geometry[0]) / column_grid)
+                    / (float(input_geometry[1]) / row_grid)
+                )
+            except (ZeroDivisionError, IndexError, TypeError):
+                _pan_ref_cell_aspect = 1.0  # fallback
 
         # Set final crop_width based on master_type, using calculated value as fallback/default for most
         config.crop_width = {
