@@ -1039,7 +1039,7 @@ class VideoPlayerConfig:
         self.use_interpolation = False  # Set to False to reduce GPU load
         self.optimize_performance = True  # Set to True to enable basic optimizations
         self.extra_optimization = True  # Set to True for additional optimizations
-        self.lower_resolution = True  # Set to True to reduce resolution
+        self.lower_resolution = False  # GPU handles 4K->cell downscale natively
 
         # Maps - ensure interval_cycle is valid before using it here
         self.pixel_drop_map = {
