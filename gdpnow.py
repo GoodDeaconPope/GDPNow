@@ -2768,6 +2768,10 @@ def generate_grwm_script(session_dir):
             f.write("    vf = build_scene_filter(panscan, pan_x, pan_y, stem)\n")
             f.write("    cmd = [\n")
             f.write("        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
+            # Limit decode threads to 1 so NVDEC doesn't exceed 32 decode
+            # surfaces on 4K H.264 (16 default threads + ref frames = 33).
+            # Stage 1 is 1-input-at-a-time so single-thread decode is fine.
+            f.write("        '-threads', '1',\n")
             f.write("        '-hwaccel', 'cuda',\n")
             f.write("        '-ss', f'{start:.3f}',\n")
             f.write("        '-t', f'{dur:.3f}',\n")
