@@ -84,6 +84,21 @@ function orphanRow(o) {
     el('span', { class: 'btn icon ghost' }, icon('i-plus')));
 }
 
+/* Display order: numbered episodes by number (104, 109, ..., 400, 400+),
+   then D01..D30, then anything else. The map file keeps its own order. */
+function episodeSortKey(name) {
+  const l = label(name);
+  let m;
+  if ((m = /^(\d+)(.*)$/.exec(l))) return [0, +m[1], m[2].toLowerCase()];
+  if ((m = /^d(\d+)$/i.exec(l))) return [1, +m[1], ''];
+  return [2, 0, l.toLowerCase()];
+}
+
+function compareEpisodes(a, b) {
+  const x = episodeSortKey(a), y = episodeSortKey(b);
+  return x[0] - y[0] || x[1] - y[1] || (x[2] < y[2] ? -1 : x[2] > y[2] ? 1 : 0);
+}
+
 function renderList() {
   const box = $('#ep-list');
   box.innerHTML = '';
@@ -91,9 +106,11 @@ function renderList() {
     const taken = new Set(M.data.episodes.map((e) => label(e.key).toLowerCase()));
     const list = (M.data.orphans || []).filter((o) => !taken.has(o.label.toLowerCase()) && (!M.q || o.label.toLowerCase().includes(M.q)));
     if (!list.length) box.append(el('div', { class: 'hint', style: 'padding:14px 8px' }, 'Every numbered file in your folder already has a map entry.'));
-    list.forEach((o) => box.append(orphanRow(o)));
+    list.sort((a, b) => compareEpisodes(a.label, b.label)).forEach((o) => box.append(orphanRow(o)));
   } else {
-    M.data.episodes.forEach((ep, i) => { if (visible(ep)) box.append(epRow(ep, i)); });
+    M.data.episodes.map((ep, i) => i)
+      .sort((a, b) => compareEpisodes(M.data.episodes[a].key, M.data.episodes[b].key))
+      .forEach((i) => { const ep = M.data.episodes[i]; if (visible(ep)) box.append(epRow(ep, i)); });
   }
   const found = M.data.episodes.filter((e) => e.file).length;
   $('#map-sub').textContent = `${M.data.episodes.length} episodes · ${found} in your folder · ${M.data.is_bundled ? 'bundled map' : M.data.file}`;
