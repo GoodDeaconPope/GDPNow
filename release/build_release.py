@@ -68,6 +68,17 @@ def privacy_check(root):
             for n in needles:
                 if n and re.search(r"(?<![a-z])" + re.escape(n) + r"(?![a-z])", text):
                     found.append(f"{os.path.relpath(p, root)}: {n!r}")
+    # every file, binaries included: this PC's home folder path (pip once wrote
+    # it into console-script launchers under runtime\)
+    paths = [home.lower(), home.replace("\\", "/").lower()]
+    paths = [p.encode() for p in paths] + [p.encode("utf-16-le") for p in paths]
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            with open(p, "rb") as f:
+                data = f.read().lower()
+            if any(n in data for n in paths):
+                found.append(f"{os.path.relpath(p, root)}: home folder path")
     if found:
         raise SystemExit("PRIVACY CHECK FAILED (personal names/paths in shipped files):\n  " + "\n  ".join(found))
 
@@ -137,6 +148,9 @@ def build():
          "--find-links", os.path.join(DL, "wheels"), "--target",
          os.path.join(py, "Lib", "site-packages"), "--no-compile",
          "-r", os.path.join(REPO, "requirements.txt")])
+    # console-script launchers pip writes for the BUILD machine's Python
+    # (bottle.exe, pywin32_postinstall.exe...): unused, and they carry its path
+    shutil.rmtree(os.path.join(py, "Lib", "site-packages", "bin"), ignore_errors=True)
 
     print("runtime: mpv")
     tmp = os.path.join(BUILD, "_mpv_extract")
