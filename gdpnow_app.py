@@ -410,19 +410,12 @@ class Api:
             self._preview.terminate()
 
 
-def _style_native_window():
-    """Dark title bar + our icon + own taskbar group (not 'Python')."""
+def _apply_window_style(hwnd, repaint=False):
+    """Dark title bar + our icon. Best done before the window is first shown;
+    afterwards Windows only repaints the title bar when nudged (repaint)."""
     try:
         import win32con
         import win32gui
-        hwnd = 0
-        for _ in range(50):
-            hwnd = win32gui.FindWindow(None, APP_TITLE)
-            if hwnd:
-                break
-            time.sleep(0.1)
-        if not hwnd:
-            return
         on = ctypes.c_int(1)
         for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (new id, then pre-20H1 id)
             if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), 4) == 0:
@@ -432,6 +425,39 @@ def _style_native_window():
                 icon = win32gui.LoadImage(0, ICON_FILE, win32con.IMAGE_ICON, size, size,
                                           win32con.LR_LOADFROMFILE)
                 win32gui.SendMessage(hwnd, win32con.WM_SETICON, which, icon)
+        if repaint:  # make Windows redraw the frame with the new colors now
+            win32gui.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
+                                  | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED)
+            active = win32gui.GetForegroundWindow() == hwnd
+            win32gui.SendMessage(hwnd, win32con.WM_NCACTIVATE, int(not active), 0)
+            win32gui.SendMessage(hwnd, win32con.WM_NCACTIVATE, int(active), 0)
+    except Exception:
+        pass
+
+
+def _style_before_show(window):
+    """Runs while the window exists but is not on screen yet: the title bar
+    is dark from the very first frame."""
+    try:
+        _apply_window_style(int(window.native.Handle.ToInt64()))
+    except Exception:
+        pass
+
+
+def _style_native_window():
+    """Safety net after the window is shown (and the old path if before_show
+    is unavailable): apply again and force the title bar to repaint."""
+    try:
+        import win32gui
+        hwnd = 0
+        for _ in range(50):
+            hwnd = win32gui.FindWindow(None, APP_TITLE)
+            if hwnd:
+                break
+            time.sleep(0.1)
+        if hwnd:
+            _apply_window_style(hwnd, repaint=True)
     except Exception:
         pass
 
@@ -540,6 +566,7 @@ def main():
                                     min_size=(1000, 700), background_color="#0B0C10",
                                     text_select=False)
     _window.events.closing += api._on_closing
+    _window.events.before_show += _style_before_show
     _window.events.shown += lambda: threading.Thread(target=_style_native_window, daemon=True).start()
     # never let pywebview silently fall back to Internet Explorer (MSHTML)
     webview.start(gui="edgechromium", debug="--debug" in sys.argv)
