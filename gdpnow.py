@@ -1085,7 +1085,7 @@ class VideoPlayerConfig:
         self.optimize_performance = True  # Set to True to enable basic optimizations
         self.extra_optimization = True  # Set to True for additional optimizations
         self.lower_resolution = False  # GPU handles 4K->cell downscale natively
-        self.gpu_decode_cells = _ps.gpu_decode_cells()
+        self.gpu_decode_cells = _ps.gpu_decode_cells(column_grid * row_grid)
 
         # Maps - ensure interval_cycle is valid before using it here
         self.pixel_drop_map = {

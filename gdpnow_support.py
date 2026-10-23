@@ -882,19 +882,92 @@ def mpv_loadfile_cmd(path, start_mmss):
                                    "options": f"start={start_mmss}"}})
 
 
-# Grid cells that decode on the GPU; the others decode on the CPU. The GPU has
-# one video decoder shared by every cell: an RTX 4070 Ti decodes about seven
-# 4K (4096x2304) H.264 streams in real time, so with all 16 cells of a 4x4 on
-# it every cell played at half speed while the CPU sat at 16 % (measured).
-GPU_DECODE_CELLS = 6
+# Grid cells that decode on the GPU; the others decode on the CPU. The GPU's
+# video decoder is shared by every cell and how much it carries differs per
+# card, so it is measured once per card. An RTX 4070 Ti decodes about seven
+# 4K (4096x2304) H.264 videos in real time: with all 16 cells of a 4x4 on it,
+# every cell played at half speed while the CPU sat at 16 %; 6 GPU cells +
+# 10 CPU cells played without dropped frames (measured). The test clip here
+# measures that card at 6.3 (real 4K episodes: 6.8), so cells = whole number.
+_NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def gpu_decode_cells():
+def _gpu_name():
+    """The primary display's graphics card, e.g. "NVIDIA GeForce RTX 4070 Ti"."""
+    try:
+        import win32api
+        i = 0
+        while True:
+            d = win32api.EnumDisplayDevices(None, i)
+            if d.StateFlags & 4:  # DISPLAY_DEVICE_PRIMARY_DEVICE
+                return d.DeviceString
+            i += 1
+    except Exception:
+        return "unknown"
+
+
+def measure_gpu_decode(parallel=4, loops=4):
+    """How many 4K H.264 videos (30 fps) the GPU decodes in real time, the way
+    the grid's mpv does it (D3D11, frames copied back); 0.0 if it cannot.
+    Several at once because some cards have more than one decoder."""
+    import tempfile
+    import time
+    tmp = tempfile.mkdtemp(prefix="gdpnow_gpu_")
+    clip = os.path.join(tmp, "test4k.mp4")
+    try:
+        subprocess.run([FFMPEG_EXE, "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=4096x2304:r=30:d=2",
+                        "-vf", "noise=alls=8:allf=t", "-c:v", "libx264", "-preset", "veryfast", "-b:v", "24M",
+                        "-maxrate", "24M", "-bufsize", "12M", "-pix_fmt", "yuv420p", clip],
+                       capture_output=True, timeout=120, creationflags=_NOWIN)
+        if not os.path.isfile(clip):
+            return 0.0
+        cmd = [FFMPEG_EXE, "-nostdin", "-v", "verbose", "-hwaccel", "d3d11va", "-stream_loop", str(loops - 1),
+               "-i", clip, "-f", "null", "-"]
+        logs = [os.path.join(tmp, f"dec{k}.log") for k in range(parallel)]
+        outs = [open(log, "wb") for log in logs]
+        t0 = time.time()
+        procs = [subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=out, creationflags=_NOWIN) for out in outs]
+        for p in procs:
+            p.wait(timeout=300)
+        wall = time.time() - t0
+        for out in outs:
+            out.close()
+        for p, log in zip(procs, logs):
+            # ffmpeg quietly decodes on the CPU when the GPU cannot
+            with open(log, "rb") as f:
+                if p.returncode or b"pix_fmt: d3d11" not in f.read():
+                    return 0.0
+        return parallel * loops * 60 / wall / 30
+    except Exception:
+        return 0.0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def gpu_decode_cells(grid_size):
     value = os.environ.get("GDPNOW_GPU_DECODE_CELLS") or load_settings().get("gpu_decode_cells")
     try:
         return max(0, int(value))
     except (TypeError, ValueError):
-        return GPU_DECODE_CELLS
+        pass
+    if grid_size <= 4:
+        return grid_size  # small grids: every cell on the GPU, as always
+    name = _gpu_name()
+    cal = load_settings().get("gpu_decode")
+    if isinstance(cal, dict) and cal.get("gpu") == name and isinstance(cal.get("cells"), int):
+        return cal["cells"]
+    print("Measuring this PC's video decoder (once per graphics card, a few seconds)...")
+    streams = measure_gpu_decode()
+    cells = int(streams)
+    print(f"  {name}: about {streams:.1f} 4K videos at once; {cells} grid cells decode on the GPU, the rest on the CPU")
+    if streams > 0:  # a failed measurement is tried again next session
+        settings = load_settings()
+        settings["gpu_decode"] = {"gpu": name, "streams_4k": round(streams, 1), "cells": cells}
+        try:
+            save_settings(settings)
+        except OSError:
+            pass
+    return cells
 
 
 def screenshots_dir():
