@@ -1480,7 +1480,7 @@ class NutCounter:
     - finalize() is idempotent.
     """
 
-    DEFAULT_OUTPUT_DIR = r"%USERPROFILE%\Pictures\gdpnow_nuts"
+    DEFAULT_OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "gdpnow_nuts")
     HOST_WINDOW_CLASS = "GridHostWindowClass"
 
     @staticmethod
