@@ -1,4 +1,8 @@
-import tkinter as tk
+try:
+    import tkinter as tk  # unused
+except ImportError:
+    tk = None
+import gdpnow_support as _ps
 import shlex
 import shutil
 import subprocess
@@ -1129,14 +1133,14 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index):
     socket_params = f"--input-ipc-server=mpvsocket{socket_index} "
 
     # Assemble the command
-    command = f"mpv --start={start_time} \"{video_file}\" --geometry={geometry} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
+    command = f"--geometry={geometry} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
     # print(f"Generated Command (Socket {socket_index}): {command}") # Debug print
     # Use shlex for proper quoting, especially for filenames with spaces
     # Ensure quotes around video_file are handled correctly by shlex if needed, but usually better handled by Popen directly if command is passed as list
     # Passing the whole string to Popen with shell=True is generally discouraged for security.
     # shlex.split works well here.
     try:
-        split_command = shlex.split(command)
+        split_command = [_ps.MPV_EXE, f"--start={start_time}", video_file] + shlex.split(command)
         # print(f"Shlex Split Command: {split_command}") # Debug print
         return split_command
     except ValueError as e:
@@ -1227,58 +1231,9 @@ def prepare_video_list():
     handles command line args, shuffles, returns list with correct paths.
     """
     
-    # 1. Hardcoded path to the map file
-    map_file = r'E:\1SystemFile\systemFileMap.json'
-    
-    # 2. Define directories to search for video files
-    #    '.' is the current directory.
-    video_search_dirs = ['.', r'E:\1SystemFile']
-
-    if not os.path.exists(map_file):
-         print(f"Error: Cannot find video map file: {map_file}")
-         return []
-    try:
-        with open(map_file, 'r', encoding='utf-8-sig') as d:
-            system_file_map = json.load(d)
-    except json.JSONDecodeError as e:
-         print(f"Error decoding JSON from {map_file}: {e}")
-         return []
-    except Exception as e:
-         print(f"Error reading {map_file}: {e}")
-         return []
-
-    if not isinstance(system_file_map, dict):
-        print(f"Error: Content of {map_file} is not a JSON object (dictionary).")
-        return []
-
-    # 3. Build a dictionary of available files: { filename: full_path }
-    #    We search E:\1SystemFile first, then Current Dir.
-    #    This means if a file exists in BOTH, the Current Dir version takes priority (overwrites).
-    available_files = {}
-
-    for search_dir in video_search_dirs:
-        if os.path.exists(search_dir):
-            # Find all mp4s in this directory
-            search_pattern = os.path.join(search_dir, '*.mp4')
-            found_paths = glob.glob(search_pattern)
-            
-            for path in found_paths:
-                filename = os.path.basename(path)
-                # Store mapped to the specific path found (local relative or E: absolute)
-                available_files[filename] = path
-
-    # 4. Filter and Update the map
-    #    We only keep entries from JSON that exist on disk.
-    #    We update the Key to be the `full_path` so the downstream player can find it.
-    valid_system_map = {}
-    
-    for key, metadata in system_file_map.items():
-        # The JSON key is likely just "video.mp4". We check if we found it.
-        if key in available_files:
-            actual_path = available_files[key]
-            valid_system_map[actual_path] = metadata
-
-    system_file_map = valid_system_map
+    # Portable release: systemFileMap.json ships in app\, the video folder
+    # is the user's own, files are matched to map entries by number.
+    system_file_map = _ps.load_matched_map()
 
     if not system_file_map:
         print("Warning: No matching video files found in '.' or 'E:\\1SystemFile'.")
@@ -1292,7 +1247,7 @@ def prepare_video_list():
         for key in list(remaining_map.keys()):
             # 'key' might now be a full path like 'E:\1SystemFile\vid.mp4'
             # 'arg' might be 'vid'. Substring match still works perfectly.
-            if arg in key: 
+            if _ps.arg_matches(arg, key): 
                 found_key = key
                 break 
 
@@ -1480,7 +1435,7 @@ class NutCounter:
     - finalize() is idempotent.
     """
 
-    DEFAULT_OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "gdpnow_nuts")
+    DEFAULT_OUTPUT_DIR = _ps.screenshots_dir()
     HOST_WINDOW_CLASS = "GridHostWindowClass"
 
     @staticmethod
@@ -1563,7 +1518,7 @@ class NutCounter:
         if size in self._font_cache:
             return self._font_cache[size]
         font = None
-        for candidate in (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\arial.ttf"):
+        for candidate in _ps.FONT_CANDIDATES:
             try:
                 font = ImageFont.truetype(candidate, size)
                 break
@@ -1613,7 +1568,7 @@ class NutCounter:
                 pos_sec = max(0.0, info["started_pos_sec"] + elapsed)
                 mm = int(pos_sec) // 60
                 ss = int(pos_sec) % 60
-                stem = os.path.splitext(os.path.basename(info["filename"]))[0]
+                stem = _ps.label_for(info["filename"])
                 label = f"{stem}  {mm:d}:{ss:02d}"
                 x = col * cell_w + pad
                 y = row * cell_h + pad
@@ -1788,7 +1743,7 @@ nut_counter = NutCounter()
 # E key / CSP swap + GRWM script generator
 # ============================================================
 
-_SOURCE_ROOT_DEFAULT = r"E:\1SystemFile"
+_SOURCE_ROOT_DEFAULT = _ps.ROOT
 
 
 def _resolve_source_path(filename):
@@ -2234,7 +2189,7 @@ def trigger_csp_swap():
             skipped += 1
             continue
         start_str = seconds_to_mmss(start_sec)
-        cmd = f'loadfile {filename} replace "start={start_str}"'
+        cmd = _ps.mpv_loadfile_cmd(filename, start_str)
         pipe_name = _pipe_name_for(socket_idx)
 
         print(f"  Socket {socket_idx}: sending via {pipe_name}: {cmd}", flush=True)
@@ -2595,7 +2550,7 @@ def generate_grwm_script(session_dir):
     # which is ffmpeg's filter-option separator, so we wrap it in single
     # quotes and escape the colon with a backslash.
     label_font_size = max(18, min(42, int(cell_h * 0.04)))
-    label_font_path = r"C\:/Windows/Fonts/arialbd.ttf"
+    label_font_path = _ps.FFMPEG_FONT
     label_pad = max(8, label_font_size // 3)
 
     # ---- Build SCENES list for the multi-pass runner ----
@@ -2616,7 +2571,7 @@ def generate_grwm_script(session_dir):
         scenes = cell_scenes.get(socket_idx, [])
         cell_scene_total[socket_idx] = sum(s["duration"] for s in scenes)
         for scene_idx, scene in enumerate(scenes):
-            stem = os.path.splitext(os.path.basename(scene["filename"]))[0]
+            stem = _ps.label_for(scene["filename"])
             SCENES.append((
                 socket_idx,
                 scene_idx,
@@ -2643,7 +2598,7 @@ def generate_grwm_script(session_dir):
     output_video = os.path.join(session_dir, "grwm.mp4")
 
     # Escape font path backslashes for ffmpeg filter (fontfile='C\:/...')
-    ff_font_path = r"C\:/Windows/Fonts/arialbd.ttf"
+    ff_font_path = _ps.FFMPEG_FONT
 
     try:
         with open(runner_path, "w", encoding="utf-8", newline="\n") as f:
@@ -2659,6 +2614,7 @@ def generate_grwm_script(session_dir):
             f.write("#          simple filter chain). tpad applied per-cell if any cell\n")
             f.write("#          runs shorter than session total.\n")
             f.write("import subprocess, sys, os\n\n")
+            f.write(f"FFMPEG = {_ps.FFMPEG_EXE!r} if os.path.exists({_ps.FFMPEG_EXE!r}) else 'ffmpeg'\n")
             f.write(f"SESSION_DIR = {session_dir!r}\n")
             f.write(f"OUTPUT      = {output_video!r}\n")
             f.write(f"TILES_DIR   = os.path.join(SESSION_DIR, 'tiles')\n")
@@ -2681,20 +2637,7 @@ def generate_grwm_script(session_dir):
                     f"{pan:.3f}, {px:.3f}, {py:.3f}, {stem!r}),\n"
                 )
             f.write("]\n\n")
-            f.write("ENC_OPTS = [\n")
-            f.write("    '-c:v', 'h264_nvenc',\n")
-            f.write("    '-preset', 'p1',\n")
-            f.write("    '-tune', 'hq',\n")
-            f.write("    '-rc', 'vbr',\n")
-            f.write("    '-cq', '15',\n")
-            f.write("    '-b:v', '30M',\n")
-            f.write("    '-maxrate', '60M',\n")
-            f.write("    '-bufsize', '120M',\n")
-            f.write("    '-bf', '3',\n")
-            f.write("    '-b_ref_mode', 'middle',\n")
-            f.write("    '-temporal-aq', '1',\n")
-            f.write("    '-spatial-aq', '1',\n")
-            f.write("    '-rc-lookahead', '20',\n")
+            f.write("ENC_OPTS = " + _ps.video_enc_opts_literal() + " + [\n")
             f.write("    '-pix_fmt', 'yuv420p',\n")
             f.write("    '-profile:v', 'high',\n")
             f.write("    '-level', '5.1',\n")
@@ -2767,12 +2710,12 @@ def generate_grwm_script(session_dir):
             f.write("    tile_path = os.path.join(TILES_DIR, f'tile_c{cell}_s{idx:04d}.mp4')\n")
             f.write("    vf = build_scene_filter(panscan, pan_x, pan_y, stem)\n")
             f.write("    cmd = [\n")
-            f.write("        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
+            f.write("        FFMPEG, '-y', '-hide_banner', '-loglevel', 'warning',\n")
             # Limit decode threads to 1 so NVDEC doesn't exceed 32 decode
             # surfaces on 4K H.264 (16 default threads + ref frames = 33).
             # Stage 1 is 1-input-at-a-time so single-thread decode is fine.
             f.write("        '-threads', '1',\n")
-            f.write("        '-hwaccel', 'cuda',\n")
+            f.write(f"        '-hwaccel', {_ps.hwaccel_name()!r},\n")
             f.write("        '-ss', f'{start:.3f}',\n")
             f.write("        '-t', f'{dur:.3f}',\n")
             f.write("        '-i', src,\n")
@@ -2795,20 +2738,20 @@ def generate_grwm_script(session_dir):
             f.write("    with open(concat_list, 'w', encoding='utf-8') as cf:\n")
             f.write("        cf.write('ffconcat version 1.0\\n')\n")
             f.write("        for (c, i, *_) in cell_scenes_sorted:\n")
-            f.write("            path = tile_paths[(c, i)].replace('\\\\', '/')\n")
+            f.write("            path = tile_paths[(c, i)].replace('\\\\', '/').replace(\"'\", \"'\\\\''\")\n")
             f.write("            cf.write(f\"file '{path}'\\n\")\n")
             f.write("    print(f'[Stage2] Concat cell {cell} ({len(cell_scenes_sorted)} tiles)')\n")
             f.write("    run_cmd(\n")
             f.write("        f'Stage2 cell {cell}',\n")
             f.write("        [\n")
-            f.write("            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',\n")
+            f.write("            FFMPEG, '-y', '-hide_banner', '-loglevel', 'warning',\n")
             f.write("            '-f', 'concat', '-safe', '0', '-i', concat_list,\n")
             f.write("            '-c', 'copy', cell_file,\n")
             f.write("        ],\n")
             f.write("    )\n")
             f.write("    cell_files.append((cell, cell_file))\n\n")
             f.write("# ========== Stage 3: xstack cell files into final grid ==========\n")
-            f.write("stack_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'info']\n")
+            f.write("stack_cmd = [FFMPEG, '-y', '-hide_banner', '-loglevel', 'info']\n")
             f.write("for _, cf in cell_files:\n")
             f.write("    stack_cmd += ['-i', cf]\n")
             f.write("# Build per-cell tpad chain if any cell is short.\n")
@@ -2880,7 +2823,7 @@ def generate_grwm_script(session_dir):
             f.write("@echo off\r\n")
             f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(SCENES)} scenes\r\n")
             f.write("REM %~dp0 = this bat file's own dir, handles unicode paths correctly\r\n")
-            f.write("python \"%~dp0run_grwm.py\"\r\n")
+            f.write(f"\"{_ps.python_exe_for_bat()}\" \"%~dp0run_grwm.py\"\r\n")
             f.write("pause\r\n")
     except OSError as e:
         print(f"[GRWM] Failed to write bat: {e}")
@@ -2905,7 +2848,7 @@ def generate_grwm_script(session_dir):
             f.write(f"# GRWM sequential fallback - {len(flat_scenes_with_wall)} scenes\n")
             f.write("# Use this if grid replay (run_grwm.bat) is failing.\n")
             for idx, (wall, socket_idx, s) in enumerate(flat_scenes_with_wall):
-                src = _resolve_source_path(s["filename"]).replace("\\", "/")
+                src = _resolve_source_path(s["filename"]).replace("\\", "/").replace("'", "'\\''")
                 f.write(f"# scene {idx+1}: socket {socket_idx} -> {s['filename']} "
                         f"@ {s['in_sec']:.1f}s for {s['duration']:.1f}s\n")
                 f.write(f"file '{src}'\n")
@@ -2917,6 +2860,7 @@ def generate_grwm_script(session_dir):
     print(f"[GRWM] Grid replay: {cg}x{rg} grid, {len(SCENES)} scenes, {total_duration:.1f}s")
     print(f"[GRWM]   Runner: {bat_path} (or run_grwm.py)")
     print(f"[GRWM]   Sequential fallback: {seq_concat_path}")
+    _ps.session_finished(session_dir)
 
 
 def play_videos(config, video_list):
@@ -3492,7 +3436,7 @@ def cycle_videos(config):
                 f"({'CSP-cycle' if csp_mode else 'RR segment'}: {debug_info})"
             )
 
-            cmd = f'loadfile {v["filename"]} replace "start={final_start_str}"'
+            cmd = _ps.mpv_loadfile_cmd(v["filename"], final_start_str)
             send_command_to_socket_index(socket_idx, cmd)
             # Re-apply user's current view adjustments (panscan + video-pan-x/y)
             # so the newly-loaded video starts at the same zoom/center the
@@ -4057,4 +4001,4 @@ def main():
 if __name__ == "__main__":
     # Ensure the interrupt event exists globally before starting
     interrupt_event = threading.Event()
-    main()
+    _ps.run_player(main)

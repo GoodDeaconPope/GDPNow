@@ -1,0 +1,21 @@
+Third-party programs bundled in this folder
+===========================================
+
+python\   Python 3.12 embeddable package (Python Software Foundation License),
+          with these libraries: pywin32 (PSF), pynput (LGPL-3.0), Pillow (MIT-CMU),
+          screeninfo (MIT), pywebview (BSD-3-Clause), pythonnet (MIT),
+          clr_loader (MIT), cffi (MIT), pycparser (BSD-3-Clause), bottle (MIT),
+          proxy_tools (MIT), typing_extensions (PSF), six (MIT).
+          https://www.python.org
+
+mpv\      mpv media player, Windows build by zhongfly/mpv-winbuild (GPL-2.0-or-later).
+          Source: https://github.com/mpv-player/mpv
+          Build:  https://github.com/zhongfly/mpv-winbuild
+
+ffmpeg\   FFmpeg, Windows build by BtbN/FFmpeg-Builds (GPL-3.0-or-later build).
+          Source: https://ffmpeg.org  Build: https://github.com/BtbN/FFmpeg-Builds
+
+The window uses Microsoft Edge WebView2, which is part of Windows 11 and updated
+Windows 10. webview2\MicrosoftEdgeWebview2Setup.exe is Microsoft's own WebView2
+installer (Evergreen Bootstrapper, signed by Microsoft); GDPNow only runs it, after
+asking, on a PC that does not have WebView2 yet.

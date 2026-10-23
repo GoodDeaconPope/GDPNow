@@ -1,0 +1,870 @@
+"""Support code for gdpnow.py and the GDPNow app window.
+
+Works in two places:
+  - the repo (E:\\1SystemFile): mpv / ffmpeg / Python from PATH, the map next
+    to gdpnow.py, the videos in that same folder unless another is chosen;
+  - the release zip (GDPNow\\app\\ next to GDPNow\\runtime\\): bundled mpv,
+    ffmpeg and Python, settings and reports next to the launcher.
+It holds: tool paths, the video folder setting, matching any file name to
+the numbered entries of systemFileMap.json, the screenshot folder, the GRWM
+encoder choice (NVIDIA NVENC when it works, CPU libx264 otherwise) and the
+'DM the pope on Discord' error reports.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# release layout: GDPNow\app\ (this file) next to GDPNow\runtime\
+PORTABLE = os.path.isdir(os.path.join(os.path.dirname(APP_DIR), "runtime"))
+ROOT = os.path.dirname(APP_DIR) if PORTABLE else APP_DIR
+RUNTIME = os.path.join(ROOT, "runtime")
+
+
+def _tool(bundled, name):
+    if PORTABLE and os.path.isfile(bundled):
+        return bundled
+    # ask for name.exe: Python's PATH search also looks in the current folder,
+    # where an unrelated file called just "mpv" must not win
+    return (shutil.which(name + ".exe") or shutil.which(name + ".com")
+            or (bundled if os.path.isfile(bundled) else name))
+
+
+MPV_EXE = _tool(os.path.join(RUNTIME, "mpv", "mpv.exe"), "mpv")
+FFMPEG_EXE = _tool(os.path.join(RUNTIME, "ffmpeg", "ffmpeg.exe"), "ffmpeg")
+if PORTABLE:
+    PYTHON_EXE = os.path.join(RUNTIME, "python", "python.exe")
+else:  # the Python running us; python.exe (console), not pythonw.exe
+    _py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    PYTHON_EXE = _py if os.path.isfile(_py) else sys.executable
+DEFAULT_MAP_FILE = os.path.join(APP_DIR, "systemFileMap.json")
+# settings, the matching report and error reports: next to the launcher in the
+# release; in the user's AppData when running from the repo (keeps it clean)
+STATE_DIR = ROOT if PORTABLE else os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GDPNow")
+REPORT_FILE = os.path.join(STATE_DIR, "video_matches.txt")
+
+VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".wmv", ".webm",
+              ".ts", ".m2ts", ".flv", ".mpg", ".mpeg"}
+
+_WINDIR = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+FONT_CANDIDATES = (os.path.join(_WINDIR, "Fonts", "arialbd.ttf"),
+                   os.path.join(_WINDIR, "Fonts", "arial.ttf"))
+# ffmpeg filter syntax: forward slashes, drive colon escaped ("C\:/Windows/...")
+FFMPEG_FONT = FONT_CANDIDATES[0].replace("\\", "/").replace(":", "\\:", 1)
+
+_CHOOSE_FLAGS = ("--choose-folder", "--change-folder")
+_choose_requested = any(a.lower() in _CHOOSE_FLAGS for a in sys.argv[1:])
+sys.argv[1:] = [a for a in sys.argv[1:] if a.lower() not in _CHOOSE_FLAGS]
+
+# --answers <file.json>: the GUI launcher fills in the console questions
+_answers = None
+if "--answers" in sys.argv[1:]:
+    _i = sys.argv.index("--answers")
+    try:
+        with open(sys.argv[_i + 1], "r", encoding="utf-8") as _f:
+            _answers = json.load(_f)
+    except (IndexError, OSError, ValueError) as _e:
+        print(f"Could not read answers file: {_e}")
+        _answers = {}
+    del sys.argv[_i:_i + 2]
+
+# prompt text (lower case) -> answers key; first match wins
+_PROMPTS = (
+    ("select monitor number", "monitor"),
+    ("master type", "master_type"),
+    ("(columns)", "cols"),
+    ("(rows)", "rows"),
+    ("to cycle per window", "cycle"),
+    ("interval per video switch", "interval"),
+    ("total session duration", "minutes"),
+)
+_asked = {}
+
+
+def _answering_input(prompt=""):
+    """builtins.input replacement used when the GUI launched us."""
+    low = str(prompt).lower()
+    key = next((k for text, k in _PROMPTS if text in low), None)
+    _asked[low] = _asked.get(low, 0) + 1
+    if _asked[low] > 3:  # the script rejected the answer and keeps asking
+        raise EOFError(f"no valid answer for: {prompt.strip()}")
+    value = "" if key is None else str(_answers.get(key, ""))
+    print(f"{prompt}{value}", flush=True)
+    return value
+
+
+if _answers is not None:
+    import builtins
+    builtins.input = _answering_input
+
+_labels = {}          # full path -> label shown on screen ("330")
+_matched_map = None   # {full path: metadata}, built by startup()
+
+
+# ---------------------------------------------------------------- settings
+_settings_file = None
+_settings_lock = threading.Lock()
+
+
+def _settings_path():
+    """settings.json in STATE_DIR; in the release, %LOCALAPPDATA%\\GDPNow if
+    the folder is read-only (e.g. unzipped under Program Files). Decided once."""
+    global _settings_file, STATE_DIR, REPORT_FILE, REPORTS_DIR
+    with _settings_lock:
+        if _settings_file is None:
+            try:
+                os.makedirs(STATE_DIR, exist_ok=True)
+                probe = os.path.join(STATE_DIR, f".write_test_{os.getpid()}")
+                with open(probe, "w") as f:
+                    f.write("ok")
+                os.remove(probe)
+            except OSError:
+                base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+                STATE_DIR = os.path.join(base, "GDPNow")
+                os.makedirs(STATE_DIR, exist_ok=True)
+                REPORT_FILE = os.path.join(STATE_DIR, "video_matches.txt")
+                REPORTS_DIR = os.path.join(STATE_DIR, "error reports")
+            _settings_file = os.path.join(STATE_DIR, "settings.json")
+        return _settings_file
+
+
+def load_settings():
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    path = _settings_path()
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)  # readers never see a half-written file
+
+
+# ------------------------------------------------------------ folder picker
+def _pick_folder_dialog(title):
+    """Windows folder picker (the modern Explorer-style one). Returns a
+    path or None if cancelled / unavailable."""
+    try:
+        import pythoncom
+        from win32com.shell import shell, shellcon
+        pythoncom.CoInitialize()
+        dlg = pythoncom.CoCreateInstance(shell.CLSID_FileOpenDialog, None,
+                                         pythoncom.CLSCTX_INPROC_SERVER,
+                                         shell.IID_IFileOpenDialog)
+        dlg.SetOptions(dlg.GetOptions() | shellcon.FOS_PICKFOLDERS
+                       | shellcon.FOS_FORCEFILESYSTEM | shellcon.FOS_PATHMUSTEXIST)
+        dlg.SetTitle(title)
+        try:
+            dlg.Show(0)
+        except pythoncom.com_error:
+            return None  # cancelled
+        return dlg.GetResult().GetDisplayName(shellcon.SIGDN_FILESYSPATH)
+    except Exception as e:
+        print(f"(Folder window unavailable: {e})")
+    try:
+        from win32com.shell import shell, shellcon
+        pidl, _, _ = shell.SHBrowseForFolder(0, None, title, 0x0001 | 0x0040)
+        return shell.SHGetPathFromIDList(pidl).decode("mbcs") if pidl else None
+    except Exception:
+        return None
+
+
+def choose_video_dir():
+    print("\nPick the folder where your videos are kept (a window will open).")
+    path = _pick_folder_dialog("GDPNow: pick the folder that holds your videos")
+    while not path or not os.path.isdir(path):
+        typed = input("No folder picked. Paste the folder path here and press Enter "
+                      "(or just Enter to try the window again): ").strip().strip('"')
+        path = typed if typed else _pick_folder_dialog("GDPNow: pick your video folder")
+    path = os.path.abspath(path)
+    settings = load_settings()
+    settings["video_dir"] = path
+    save_settings(settings)
+    print(f"Saved. Video folder: {path}")
+    return path
+
+
+def map_file():
+    """systemFileMap.json in use: the one picked in the app, else the bundled copy."""
+    path = load_settings().get("map_file")
+    return path if path and os.path.isfile(path) else DEFAULT_MAP_FILE
+
+
+def load_map(path=None):
+    with open(path or map_file(), "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("the map file is not a JSON object")
+    return data
+
+
+def get_video_dir():
+    path = load_settings().get("video_dir")
+    if not path and not PORTABLE and not _choose_requested:
+        path = APP_DIR  # from the repo: the videos live next to gdpnow.py
+    if _answers is not None and (not path or not os.path.isdir(path)):
+        raise SystemExit(f"Video folder not found: {path!r}. Pick it in the GDPNow window.")
+    if _choose_requested or not path or not os.path.isdir(path):
+        if path and not _choose_requested:
+            print(f"The saved video folder is missing: {path}")
+        path = choose_video_dir()
+    return path
+
+
+# ------------------------------------------------------- name -> map entry
+_EPISODE_MARKER = re.compile(
+    r"(?:^|[^a-z0-9])(?:e|ep|eps|episode|no|n°|#)[\s._\-#.]*0*(\d{1,3})(?!\d)", re.I)
+_D_KEY = re.compile(r"(?:^|[^a-z0-9])d[\s._\-]*0*(\d{1,2})(?!\d)", re.I)
+# standalone numbers only: not "x264", "5.1", "18yo", "1080p"
+_BARE_NUMBER = re.compile(r"(?<![A-Za-z0-9.])(\d{1,3})(?![A-Za-z0-9])")
+
+
+def _map_indexes(map_keys):
+    exact, by_num, by_d = {}, {}, {}
+    for key in map_keys:
+        stem = os.path.splitext(key)[0]
+        exact[stem.lower()] = key
+        if stem.isdigit():
+            by_num[int(stem)] = key
+        m = re.fullmatch(r"[dD](\d+)", stem)
+        if m:
+            by_d[int(m.group(1))] = key
+    return exact, by_num, by_d
+
+
+def match_name(stem, indexes):
+    """Map one file name (without extension) to a map key, or None.
+
+    Order: exact name ("330", "D01", "400+") -> pure number with any zero
+    padding ("75", "075") -> episode marker ("E330", "Ep 75", "#330") ->
+    "D7"/"D07" style -> the only 1-3 digit number in the name that is a
+    known episode. Names with several candidate numbers stay unmatched
+    rather than guessed."""
+    exact, by_num, by_d = indexes
+    s = stem.strip()
+    if s.lower() in exact:
+        return exact[s.lower()]
+    if s.isdigit():
+        return by_num.get(int(s))
+    m = _EPISODE_MARKER.search(s)
+    if m and int(m.group(1)) in by_num:
+        return by_num[int(m.group(1))]
+    m = _D_KEY.search(s)
+    if m and int(m.group(1)) in by_d:
+        return by_d[int(m.group(1))]
+    nums = {int(n) for n in _BARE_NUMBER.findall(s)}
+    hits = [by_num[n] for n in nums if n in by_num]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def guess_episode(stem):
+    """The episode number a file name seems to carry, map or no map
+    ("277" for "E277", "D07" for "d7"), or None."""
+    s = stem.strip()
+    if s.isdigit() and len(s) <= 4:
+        return f"{int(s):03d}"
+    m = _EPISODE_MARKER.search(s)
+    if m:
+        return f"{int(m.group(1)):03d}"
+    m = _D_KEY.search(s)
+    if m:
+        return f"D{int(m.group(1)):02d}"
+    nums = set(_BARE_NUMBER.findall(s))
+    return f"{int(nums.pop()):03d}" if len(nums) == 1 else None
+
+
+def include_subfolders():
+    return bool(load_settings().get("include_subfolders", True))
+
+
+def scan_videos(video_dir, recursive=None):
+    """Video files in video_dir, and in its subfolders unless turned off."""
+    if recursive is None:
+        recursive = include_subfolders()
+    found = []
+    for dirpath, dirnames, filenames in os.walk(video_dir):
+        dirnames[:] = [d for d in dirnames if recursive and not d.startswith((".", "$"))]
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                found.append(os.path.join(dirpath, name))
+    return found
+
+
+def match_videos(video_dir, map_keys):
+    """Scan video_dir and pair files with map keys.
+    Returns (chosen {key: path}, dupes {key: [paths]}, unmatched [paths]).
+    When an episode is found more than once, the copy closest to the chosen
+    folder wins (old copies usually sit in subfolders), then the largest."""
+    indexes = _map_indexes(map_keys)
+    chosen, dupes, unmatched = {}, {}, []
+
+    def rank(p):
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            size = 0
+        return (-p.count(os.sep), size)
+
+    for path in scan_videos(video_dir):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        key = match_name(stem, indexes)
+        if key is None:
+            unmatched.append(path)
+            continue
+        if key in chosen:
+            dupes.setdefault(key, [chosen[key]]).append(path)
+            if rank(path) > rank(chosen[key]):
+                chosen[key] = path
+        else:
+            chosen[key] = path
+    return chosen, dupes, unmatched
+
+
+def split_unmatched(unmatched):
+    """(files whose episode number is not in the map, files with no number)."""
+    not_in_map, no_number = [], []
+    for p in unmatched:
+        g = guess_episode(os.path.splitext(os.path.basename(p))[0])
+        (not_in_map if g else no_number).append((p, g))
+    return not_in_map, [p for p, _ in no_number]
+
+
+def build_matched_map(video_dir, system_file_map, write_report=True):
+    chosen, dupes, unmatched = match_videos(video_dir, list(system_file_map))
+    result = {}
+    for key, meta in system_file_map.items():  # keep the map's order
+        if key in chosen:
+            result[chosen[key]] = meta
+            _labels[chosen[key]] = os.path.splitext(key)[0]
+    missing = [k for k in system_file_map if k not in chosen]
+    if write_report:
+        _write_report(video_dir, chosen, dupes, unmatched, missing)
+    return result, len(unmatched), len(missing)
+
+
+def _write_report(video_dir, chosen, dupes, unmatched, missing):
+    lines = [f"GDPNow video matching report", f"Video folder: {video_dir}", "",
+             f"MATCHED ({len(chosen)}): map entry -> your file"]
+    for key in sorted(chosen, key=lambda k: (not k[0].isdigit(), k)):
+        lines.append(f"  {os.path.splitext(key)[0]:>6}  ->  {chosen[key]}")
+    if dupes:
+        lines += ["", "SAME EPISODE FOUND MORE THAN ONCE (used: the one marked *, closest "
+                  "to the video folder, then the largest):"]
+        for key, paths in dupes.items():
+            marked = [("* " if p == chosen[key] else "  ") + p for p in paths]
+            lines.append(f"  {os.path.splitext(key)[0]}:")
+            lines += [f"      {m}" for m in marked]
+    not_in_map, no_number = split_unmatched(unmatched)
+    lines += ["", f"EPISODE NOT IN THE MAP ({len(not_in_map)}): add them on the Episode map "
+              "page (with their scene times) if they should play"]
+    lines += [f"  {g:>6}  <-  {p}" for p, g in sorted(not_in_map, key=lambda x: x[1])]
+    lines += ["", f"NO EPISODE NUMBER FOUND ({len(no_number)}): rename these to their "
+              "episode number (for example 330.mp4 or 075.mp4) if they should play"]
+    lines += [f"  {p}" for p in sorted(no_number)]
+    lines += ["", f"MAP ENTRIES WITH NO FILE ({len(missing)}):",
+              "  " + ", ".join(os.path.splitext(k)[0] for k in missing)]
+    try:
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        print(f"(Could not write {REPORT_FILE}: {e})")
+
+
+def label_for(path):
+    """On-screen label for a video: its episode number, not the file name."""
+    return _labels.get(path) or os.path.splitext(os.path.basename(path))[0]
+
+
+def arg_matches(arg, path):
+    """Command-line 'play this one first' arguments ('330', '330.mp4')."""
+    a = os.path.splitext(arg)[0].lower()
+    return a == label_for(path).lower() or arg in os.path.basename(path)
+
+
+def load_matched_map():
+    """Replacement for the original E:\\ map + folder lookup."""
+    if _matched_map is None:
+        startup()
+    return dict(_matched_map or {})
+
+
+# ---------------------------------------------------------------- startup
+def startup():
+    global _matched_map
+    if _matched_map is not None:
+        return
+    print("=== GDPNow ===")
+    for exe, name in ((MPV_EXE, "mpv"), (FFMPEG_EXE, "ffmpeg")):
+        if not os.path.isfile(exe):
+            print(f"Missing bundled program: {exe}\nRe-extract the whole zip and try again." if PORTABLE
+                  else f"{name} was not found. Install it or add its folder to PATH.")
+            if _answers is None:
+                input("Press Enter to close.")
+            sys.exit(1)
+    try:
+        system_file_map = load_map()
+    except (OSError, ValueError) as e:
+        print(f"Cannot read {map_file()}: {e}")
+        if _answers is None:
+            input("Press Enter to close.")
+        sys.exit(1)
+    while True:
+        video_dir = get_video_dir()
+        print(f"Looking for videos in: {video_dir}"
+              + (" (subfolders too)..." if include_subfolders() else "..."))
+        matched, n_unmatched, n_missing = build_matched_map(video_dir, system_file_map)
+        print(f"Matched {len(matched)} of your files to {len(system_file_map)} map entries; "
+              f"{n_unmatched} other video files are not in the map or have no episode number. "
+              f"Details: {REPORT_FILE}")
+        if matched:
+            break
+        if _answers is not None:
+            raise SystemExit("No videos matched. Pick another folder in the GDPNow window.")
+        print("\nNone of the videos in that folder could be matched to an episode number.")
+        print("Pick another folder, or rename the files to their numbers (e.g. 330.mp4).")
+        globals()["_choose_requested"] = True
+    _matched_map = matched
+    if _answers and _answers.get("stop_file"):
+        threading.Thread(target=_watch_stop_file, args=(_answers["stop_file"],),
+                         daemon=True, name="StopFileWatcher").start()
+
+
+def _watch_stop_file(path):
+    """The app's Stop button creates this file: same exit path as pressing Q
+    (screenshots + GRWM script are saved, then everything closes)."""
+    import time
+    while not os.path.exists(path):
+        time.sleep(0.2)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    print("\n[GDPNow] Stop requested from the app window.", flush=True)
+    import __main__
+    __main__.force_shutdown_and_exit()
+
+
+# ---------------------------------------------------------- error reports
+SUPPORT_LINE = "DM the pope on Discord"
+REPORTS_DIR = os.path.join(STATE_DIR, "error reports")
+DISCORD_LIMIT = 1900  # one Discord message is 2000 characters
+
+
+class _Tee:
+    """stdout/stderr wrapper that also keeps the last lines for an error report."""
+
+    def __init__(self, stream, sink):
+        self._stream, self._sink = stream, sink
+
+    def write(self, s):
+        self._sink.append(s)
+        try:
+            return self._stream.write(s)
+        except Exception:
+            return len(s)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+_output = []        # everything the player printed (trimmed to the tail)
+_session_saved = False
+
+
+def _output_tail(n=150):
+    text = "".join(_output[-4000:])
+    return "\n".join(text.splitlines()[-n:])
+
+
+def _redact(text):
+    """Hide the Windows user name (paths under the profile folder)."""
+    home = os.path.expanduser("~")
+    if home and len(home) > 3:
+        text = re.sub(re.escape(home), "%USERPROFILE%", text, flags=re.I)
+        text = re.sub(re.escape(home.replace("\\", "/")), "%USERPROFILE%", text, flags=re.I)
+    return text
+
+
+def _system_info():
+    lines = []
+    try:
+        with open(os.path.join(APP_DIR, "VERSION.txt"), encoding="utf-8") as f:
+            lines.append("GDPNow: " + f.read().strip())
+    except OSError:
+        lines.append("GDPNow: (no VERSION.txt)")
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            def val(n):
+                try:
+                    return winreg.QueryValueEx(k, n)[0]
+                except OSError:
+                    return "?"
+            lines.append(f"Windows: {val('ProductName')} {val('DisplayVersion')} "
+                         f"build {val('CurrentBuild')}.{val('UBR')}")
+    except Exception:
+        lines.append(f"Windows: {sys.getwindowsversion()}")
+    lines.append(f"Python: {sys.version.split()[0]} {'64' if sys.maxsize > 2**32 else '32'}-bit")
+    try:
+        import gdpnow_app
+        lines.append(f"WebView2: {gdpnow_app._webview2_version() or 'not found'}; "
+                     f".NET 4.7.2+: {gdpnow_app._dotnet_ok()}")
+    except Exception as e:
+        lines.append(f"WebView2: (check failed: {e})")
+    try:
+        import win32api
+        gpus, i = [], 0
+        while True:
+            try:
+                d = win32api.EnumDisplayDevices(None, i)
+            except Exception:
+                break
+            if d.DeviceString and d.DeviceString not in gpus:
+                gpus.append(d.DeviceString)
+            i += 1
+        lines.append("Graphics: " + ("; ".join(gpus) or "?"))
+    except Exception:
+        pass
+    try:
+        from screeninfo import get_monitors
+        lines.append("Screens: " + "; ".join(f"{m.width}x{m.height} at {m.x},{m.y}"
+                                             + (" (main)" if m.is_primary else "")
+                                             for m in get_monitors()))
+    except Exception:
+        pass
+    lines.append(f"App folder: {ROOT} ({'release' if PORTABLE else 'repo'})")
+    lines.append(f"mpv: {MPV_EXE if os.path.isfile(MPV_EXE) else 'NOT FOUND'}; "
+                 f"ffmpeg: {FFMPEG_EXE if os.path.isfile(FFMPEG_EXE) else 'NOT FOUND'}")
+    s = load_settings()
+    lines.append(f"Video folder: {s.get('video_dir')} (subfolders: {s.get('include_subfolders', True)})")
+    lines.append(f"Map file: {'bundled' if map_file() == DEFAULT_MAP_FILE else map_file()}")
+    if s.get("last_answers"):
+        lines.append(f"Last choices: {json.dumps(s['last_answers'])}")
+    return lines
+
+
+def build_report(where, details, log_text=""):
+    """(full report, short version that fits in one Discord message)."""
+    import datetime
+    details = (details or "").strip()
+    last = next((l.strip() for l in reversed(details.splitlines()) if l.strip()), "unknown error")
+    head = [f"GDPNow error report ({datetime.datetime.now():%Y-%m-%d %H:%M:%S})",
+            f"Where: {where}", f"Error: {last}"]
+    try:
+        info = _system_info()
+    except Exception as e:
+        info = [f"(system info failed: {e})"]
+    full = "\n".join(head + info + ["", "--- details ---", details])
+    if log_text.strip():
+        full += "\n\n--- last lines of the log ---\n" + log_text.strip()
+    full = _redact(full)
+    return full, short_report(full)
+
+
+def short_report(full):
+    """The part of a full report that fits in one Discord message: the
+    header lines and the end of the details (where the actual error is)."""
+    top, _, rest = full.partition("\n\n--- details ---\n")
+    details = rest.split("\n\n--- last lines of the log ---\n")[0].strip()
+    head = "\n".join(top.splitlines()[:7])
+    budget = max(200, DISCORD_LIMIT - len(head) - 12)
+    tail = details[-budget:]
+    if len(details) > budget:
+        tail = "..." + tail[tail.find("\n") + 1:] if "\n" in tail else tail
+    return f"{head}\n```\n{tail}\n```"
+
+
+def save_report(full):
+    import datetime
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = os.path.join(REPORTS_DIR, f"GDPNow error {datetime.datetime.now():%Y-%m-%d %H-%M-%S}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(full + "\n")
+    return path
+
+
+def report_error_native(where, details, log_text=""):
+    """Error dialog for when the app window can't show one: save the full
+    report, show the short one in a text box for the user to copy."""
+    full, short = build_report(where, details, log_text)
+    try:
+        path = save_report(full)
+    except Exception:
+        path = None
+    intro = (f"Something went wrong ({where}).\r\n"
+             "Copy the text below (it is already selected: press Ctrl+C) and paste it into the chat."
+             + (f"\r\nThe full report is also saved in the \"error reports\" folder as {os.path.basename(path)}."
+                if path else ""))
+    try:
+        _error_dialog(intro, short)
+    except Exception:  # plain box as a fallback (Ctrl+C copies a message box's text)
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, f"{SUPPORT_LINE}.\n\n{intro}\n\n{short}", "GDPNow - error",
+                                         0x10 | 0x10000)
+    return path
+
+
+def _error_dialog(intro, report):
+    """Native dialog: error icon, 'DM the pope on Discord', the intro, a
+    read-only text box holding the report (pre-selected) and an OK button.
+    Works without WebView2; the clipboard is never touched for the user."""
+    import ctypes
+    import win32con
+    import win32gui
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor v2
+    except Exception:
+        pass
+    actctx = _activate_comctl6()
+    try:
+        ID_ICON, ID_TITLE, ID_INTRO, ID_EDIT = 101, 102, 103, 104
+        W, H = 330, 236
+        style = (win32con.WS_POPUP | win32con.WS_CAPTION | win32con.WS_SYSMENU | win32con.DS_MODALFRAME
+                 | win32con.DS_CENTER | win32con.DS_SETFONT | win32con.WS_VISIBLE)
+        child = win32con.WS_CHILD | win32con.WS_VISIBLE
+        template = [
+            ["GDPNow - error", (0, 0, W, H), style, win32con.WS_EX_TOPMOST, (9, "Segoe UI")],
+            ["Static", "", ID_ICON, (10, 10, 20, 20), child | win32con.SS_ICON],
+            ["Static", SUPPORT_LINE, ID_TITLE, (40, 10, W - 50, 12), child],
+            ["Static", intro.replace("\r\n", "\n"), ID_INTRO, (40, 24, W - 50, 36), child],
+            ["Edit", "", ID_EDIT, (10, 64, W - 20, H - 94),
+             child | win32con.WS_BORDER | win32con.WS_VSCROLL | win32con.WS_TABSTOP | win32con.ES_MULTILINE
+             | win32con.ES_READONLY | win32con.ES_AUTOVSCROLL],
+            ["Button", "OK", win32con.IDOK, (W - 70, H - 24, 60, 15),
+             child | win32con.WS_TABSTOP | win32con.BS_DEFPUSHBUTTON],
+        ]
+        fonts = []
+
+        def proc(hwnd, msg, wparam, lparam):
+            if msg == win32con.WM_INITDIALOG:
+                win32gui.SendMessage(win32gui.GetDlgItem(hwnd, ID_ICON), win32con.STM_SETICON,
+                                     win32gui.LoadIcon(0, win32con.IDI_ERROR), 0)
+                bold = win32gui.LOGFONT()
+                bold.lfFaceName, bold.lfHeight, bold.lfWeight = "Segoe UI", -_px(hwnd, 15), 700
+                mono = win32gui.LOGFONT()
+                mono.lfFaceName, mono.lfHeight = "Consolas", -_px(hwnd, 12)
+                fonts.extend([win32gui.CreateFontIndirect(bold), win32gui.CreateFontIndirect(mono)])
+                win32gui.SendMessage(win32gui.GetDlgItem(hwnd, ID_TITLE), win32con.WM_SETFONT, fonts[0], True)
+                edit = win32gui.GetDlgItem(hwnd, ID_EDIT)
+                win32gui.SendMessage(edit, win32con.WM_SETFONT, fonts[1], True)
+                win32gui.SetWindowText(edit, report.replace("\r\n", "\n").replace("\n", "\r\n"))
+                win32gui.SetFocus(edit)
+                win32gui.SendMessage(edit, win32con.EM_SETSEL, 0, -1)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                return False  # focus was set by hand
+            if msg == win32con.WM_COMMAND and (wparam & 0xFFFF) in (win32con.IDOK, win32con.IDCANCEL):
+                win32gui.EndDialog(hwnd, wparam & 0xFFFF)
+                return True
+            return False
+
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception:
+            pass
+        win32gui.DialogBoxIndirect(0, template, 0, proc)
+        for f in fonts:
+            win32gui.DeleteObject(f)
+    finally:
+        if actctx:
+            ctypes.windll.kernel32.DeactivateActCtx(0, actctx)
+
+
+def _px(hwnd, size_at_96dpi):
+    import ctypes
+    try:
+        return int(size_at_96dpi * ctypes.windll.user32.GetDpiForWindow(hwnd) / 96)
+    except Exception:
+        return size_at_96dpi
+
+
+def _activate_comctl6():
+    """Modern-looking controls for the dialog (see ui/comctl6.manifest).
+    Returns the activation cookie, or None (the dialog then just looks older)."""
+    import ctypes
+    from ctypes import wintypes
+    manifest = os.path.join(APP_DIR, "ui", "comctl6.manifest")
+    if not os.path.isfile(manifest):
+        return None
+
+    class ACTCTXW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.ULONG), ("dwFlags", wintypes.DWORD),
+                    ("lpSource", wintypes.LPCWSTR), ("wProcessorArchitecture", wintypes.USHORT),
+                    ("wLangId", wintypes.USHORT), ("lpAssemblyDirectory", wintypes.LPCWSTR),
+                    ("lpResourceName", wintypes.LPCWSTR), ("lpApplicationName", wintypes.LPCWSTR),
+                    ("hModule", wintypes.HMODULE)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateActCtxW.restype = wintypes.HANDLE
+    ctx = ACTCTXW(cbSize=ctypes.sizeof(ACTCTXW), lpSource=manifest)
+    handle = k32.CreateActCtxW(ctypes.byref(ctx))
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        return None
+    cookie = ctypes.c_size_t()
+    if not k32.ActivateActCtx(wintypes.HANDLE(handle), ctypes.byref(cookie)):
+        return None
+    try:
+        ctypes.windll.comctl32.InitCommonControls()
+    except Exception:
+        pass
+    return cookie.value
+
+
+def run_player(main):
+    """Run the player with error reporting. Text version: an error box.
+    From the app window: the report path is printed for the window to show."""
+    global _session_saved
+    sys.stdout = _Tee(sys.stdout, _output)
+    sys.stderr = _Tee(sys.stderr, _output)
+    try:
+        startup()
+        if os.environ.get("GDPNOW_TEST_CRASH") == "player":
+            raise RuntimeError("test crash requested with GDPNOW_TEST_CRASH=player")
+        main()
+    except SystemExit as e:
+        if e.code in (0, None):
+            raise
+        _player_failed(str(e.code))
+        raise
+    except BaseException:
+        import traceback
+        _player_failed(traceback.format_exc())
+        raise SystemExit(1)
+    log = _output_tail()
+    # main() prints its own tracebacks instead of raising
+    if "Traceback (most recent call last)" in log or (
+            not _session_saved and re.search(r"^\s*Error", log, re.M)):
+        _player_failed("The player stopped with an error (see the log below).")
+
+
+def _player_failed(details):
+    log = _output_tail()
+    if "Traceback (most recent call last)" in log and "Traceback" not in details:
+        details = log[log.rfind("Traceback (most recent call last)"):]
+    where = "player (started from the app window)" if _answers is not None else "player (text version)"
+    if _answers is not None:
+        full, _ = build_report(where, details, log)
+        try:
+            path = save_report(full)
+            print(f"[GDPNow] ERROR_REPORT={path}", flush=True)
+        except Exception as e:
+            print(f"[GDPNow] could not save the error report: {e}", flush=True)
+    else:
+        print(f"\n*** Something went wrong. {SUPPORT_LINE} and send the error report. ***", flush=True)
+        report_error_native(where, details, log)
+
+
+# ------------------------------------------------------------- mpv / GRWM
+def mpv_loadfile_cmd(path, start_mmss):
+    """JSON IPC loadfile with named arguments: survives spaces/quotes in
+    paths and works on old (0.35) and new (0.38+, extra 'index' arg) mpv."""
+    return json.dumps({"command": {"name": "loadfile", "url": path,
+                                   "flags": "replace",
+                                   "options": f"start={start_mmss}"}})
+
+
+def screenshots_dir():
+    if os.environ.get("GDPNOW_OUTPUT_DIR"):
+        return os.environ["GDPNOW_OUTPUT_DIR"]
+    try:
+        from win32com.shell import shell, shellcon
+        pictures = shell.SHGetKnownFolderPath(shellcon.FOLDERID_Pictures, 0, None)
+    except Exception:
+        pictures = os.path.join(os.path.expanduser("~"), "Pictures")
+    return os.path.join(pictures, "gdpnow_nuts")
+
+
+_NVENC_FULL = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "hq", "-rc", "vbr",
+               "-cq", "15", "-b:v", "30M", "-maxrate", "60M", "-bufsize", "120M",
+               "-bf", "3", "-b_ref_mode", "middle", "-temporal-aq", "1",
+               "-spatial-aq", "1", "-rc-lookahead", "20"]
+# Older NVIDIA cards (GTX 10xx and earlier) reject b_ref_mode / temporal-aq.
+_NVENC_BASIC = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "15",
+                "-b:v", "30M", "-maxrate", "60M", "-bufsize", "120M", "-bf", "3",
+                "-spatial-aq", "1"]
+_X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+_encoder_cache = None
+
+
+def _encoder_works(opts):
+    cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+           "-i", "color=c=black:s=1920x1080:r=30:d=0.5"] + opts + [
+           "-pix_fmt", "yuv420p", "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def video_encoder():
+    """('nvenc'|'cpu', ffmpeg video options) for the GRWM video."""
+    global _encoder_cache
+    if _encoder_cache is None:
+        if _encoder_works(_NVENC_FULL):
+            _encoder_cache = ("nvenc", _NVENC_FULL)
+        elif _encoder_works(_NVENC_BASIC):
+            _encoder_cache = ("nvenc", _NVENC_BASIC)
+        else:
+            _encoder_cache = ("cpu", _X264)
+        kind = "NVIDIA GPU (NVENC)" if _encoder_cache[0] == "nvenc" else "CPU (libx264, no NVIDIA GPU found)"
+        print(f"[GRWM] Video encoder: {kind}")
+    return _encoder_cache
+
+
+def video_enc_opts_literal():
+    return repr(video_encoder()[1])
+
+
+def hwaccel_name():
+    # cuda = NVIDIA decoder; auto = whatever the PC has (Intel/AMD/none)
+    return "cuda" if video_encoder()[0] == "nvenc" else "auto"
+
+
+def python_exe_for_bat():
+    """Bundled python path for run_grwm.bat (the .bat is ASCII; use the
+    8.3 short path if the install folder has non-ASCII characters)."""
+    p = PYTHON_EXE
+    if not p.isascii():
+        try:
+            import win32api
+            p = win32api.GetShortPathName(p)
+        except Exception:
+            pass
+    return p
+
+
+_opened_sessions = set()
+
+
+def session_finished(session_dir):
+    """Open the session folder (screenshots + run_grwm.bat) in Explorer."""
+    global _session_saved
+    if not session_dir or not os.path.isdir(session_dir) or session_dir in _opened_sessions:
+        return
+    _opened_sessions.add(session_dir)
+    _session_saved = True
+    print(f"\nSession saved to: {session_dir}")
+    print("Double-click run_grwm.bat in that folder to build the grid video (grwm.mp4).")
+    print(f"[GDPNow] SESSION_DIR={session_dir}", flush=True)
+    if _answers is None and load_settings().get("open_folder_after_session", PORTABLE):
+        try:
+            os.startfile(session_dir)
+        except OSError:
+            pass

@@ -1,4 +1,22 @@
+# Whitelist: track code and the map, never the videos or build output.
 *
 !.gitignore
 !systemFileMap.json
 !*.py
+!ui/
+!ui/**
+!release/
+!release/**
+!rust/
+!rust/**
+# Rust: bundled libmpv binaries + downloads are fetched/rebuilt (see rust/docs/BUILD_LIBMPV.md)
+rust/vendor/dl/
+rust/vendor/libmpv/*.dll
+rust/vendor/libmpv/*.lib
+rust/vendor/libmpv/*.exp
+rust/vendor/libmpv/*.dll.a
+rust/vendor/libmpv/exports.txt
+rust/vendor/libmpv/lib_gen.log
+rust/**/target/
+__pycache__/
+*.pyc
