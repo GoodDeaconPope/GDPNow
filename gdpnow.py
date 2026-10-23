@@ -229,8 +229,9 @@ class MpvIpcClient:
         self._buffer = b""
         self._messages = queue.Queue()
 
-    def connect(self, timeout=10.0):
-        """Connect to the named pipe and start the reader thread."""
+    def connect(self, timeout=10.0, alive=None):
+        """Connect to the named pipe and start the reader thread. Stops
+        waiting early once alive() (the mpv process) returns False."""
         deadline = time.time() + timeout
         last_err = None
 
@@ -248,6 +249,8 @@ class MpvIpcClient:
                 break
             except pywintypes.error as e:
                 last_err = e
+                if alive is not None and not alive():
+                    break
                 time.sleep(0.05)
 
         if self.handle is None:
@@ -1082,6 +1085,7 @@ class VideoPlayerConfig:
         self.optimize_performance = True  # Set to True to enable basic optimizations
         self.extra_optimization = True  # Set to True for additional optimizations
         self.lower_resolution = False  # GPU handles 4K->cell downscale natively
+        self.gpu_decode_cells = _ps.gpu_decode_cells()
 
         # Maps - ensure interval_cycle is valid before using it here
         self.pixel_drop_map = {
@@ -1109,8 +1113,12 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
     # pynput global listener -> IPC pipe path we already own. Works with
     # GridHost parent window focus too, because it disables the VO
     # keyboard input driver entirely regardless of which window has focus.
+    # Grids of 9+ cells time video by the audio clock: display-resample redraws
+    # every cell on every screen refresh, which on a 4x4 kept the GPU at ~77 %
+    # and dropped frames; with audio sync 0 dropped, GPU ~50 % (measured)
+    sync = "audio" if config.column_grid * config.row_grid >= 9 else "display-resample"
     pc_parameters = (
-        f"--no-border --video-sync=display-resample --keepaspect "
+        f"--no-border --video-sync={sync} --keepaspect "
         f"--no-keepaspect-window --panscan=1 "
         f"--input-default-bindings=no --input-vo-keyboard=no "
         # No personal mpv scripts in the grid (keys are off there anyway): a
@@ -1127,19 +1135,20 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
     if config.use_interpolation:
         pc_parameters += "--interpolation "
 
-    # Add grid-based optimizations (from snippet 2)
-    if config.column_grid * config.row_grid >= 9:
-        pc_parameters += "--vd-lavc-skiploopfilter=all --vd-lavc-fast "
-
     # Performance optimization parameters (only if enabled)
     performance_params = ""
     scale_param = ""
     if config.optimize_performance:
-        performance_params = "--scale=bilinear --cscale=bilinear --dscale=bilinear --hwdec=auto-copy --vd-lavc-threads=4 "
+        # The first cells decode on the GPU, the rest on the CPU: one GPU video
+        # decoder serves every cell (see _ps.gpu_decode_cells)
+        hwdec = "auto-copy" if socket_index < config.gpu_decode_cells else "no"
+        performance_params = f"--scale=bilinear --cscale=bilinear --dscale=bilinear --hwdec={hwdec} --vd-lavc-threads=4 "
 
         # Add additional optimizations if enabled
         if config.extra_optimization:
-            performance_params += "--vo=gpu --cache=yes --demuxer-max-bytes=100M --vd-lavc-skiploopfilter=nonkey "
+            # CPU decoding in big grids skips H.264 deblocking (not visible at cell size)
+            skip = "all --vd-lavc-fast" if config.column_grid * config.row_grid >= 9 else "nonkey"
+            performance_params += f"--vo=gpu --cache=yes --demuxer-max-bytes=100M --vd-lavc-skiploopfilter={skip} "
 
         # Add resolution scaling if enabled and valid dimensions
         # Skip for 1x1 grid: scale filter forces exact dimensions which destroys
@@ -1226,20 +1235,24 @@ def start_mpv_instance(command_list):
         return None
 
 
-def create_socket(index, retries=100, delay=0.05):
+def create_socket(index, retries=100, delay=0.05, process=None, timeout=None):
     """Create an MpvIpcClient for the given socket index and connect it.
 
-    Returns an MpvIpcClient instance instead of a raw handle.
+    Returns an MpvIpcClient instance instead of a raw handle. With process,
+    waits up to timeout (10 s) while that mpv runs: on a busy PC (cells
+    already decoding from a slow drive) mpv's pipe took up to ~5 s (measured).
     """
     pipe_name = fr'\\.\pipe\mpvsocket{index}'
     print(f"Attempting to connect to pipe: {pipe_name}")
     client = MpvIpcClient(pipe_name)
+    if timeout is None:
+        timeout = 10.0 if process is not None else retries * delay
     try:
-        # retries * delay ~= total timeout window
-        client.connect(timeout=retries * delay)
+        client.connect(timeout=timeout,
+                       alive=(lambda: process.poll() is None) if process is not None else None)
     except RuntimeError as e:
         print(f"Error connecting to pipe {pipe_name}: {e}")
-        raise FileNotFoundError(f"Failed to connect to socket after {retries} attempts: {pipe_name}")
+        raise FileNotFoundError(f"Failed to connect to socket within {timeout:.0f} s: {pipe_name}")
     print(f"Successfully connected to pipe: {pipe_name}")
     return client
 
@@ -3072,7 +3085,24 @@ def play_videos(config, video_list):
 
         if config.production and process:
              try:
-                 socket_handle = create_socket(i)
+                 try:
+                     socket_handle = create_socket(i, process=process)
+                 except FileNotFoundError:
+                     # An mpv sometimes hung before opening its pipe (seen when a
+                     # session started right after another); the cell then stayed
+                     # black. Start that one mpv once more.
+                     print(f"    No answer from mpv on socket {i}; starting it again.")
+                     if process.poll() is None:
+                         process.kill()
+                         try:
+                             process.wait(timeout=5)
+                         except subprocess.TimeoutExpired:
+                             pass
+                     process = start_mpv_instance(command_list)
+                     processes[-1] = process
+                     if process is None:
+                         raise FileNotFoundError(f"mpv for socket {i} did not start again")
+                     socket_handle = create_socket(i, process=process, timeout=20.0)
                  sockets.append(socket_handle)
                  successful_starts += 1
              except FileNotFoundError as e:

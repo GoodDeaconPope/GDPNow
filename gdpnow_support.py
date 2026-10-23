@@ -882,6 +882,21 @@ def mpv_loadfile_cmd(path, start_mmss):
                                    "options": f"start={start_mmss}"}})
 
 
+# Grid cells that decode on the GPU; the others decode on the CPU. The GPU has
+# one video decoder shared by every cell: an RTX 4070 Ti decodes about seven
+# 4K (4096x2304) H.264 streams in real time, so with all 16 cells of a 4x4 on
+# it every cell played at half speed while the CPU sat at 16 % (measured).
+GPU_DECODE_CELLS = 6
+
+
+def gpu_decode_cells():
+    value = os.environ.get("GDPNOW_GPU_DECODE_CELLS") or load_settings().get("gpu_decode_cells")
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return GPU_DECODE_CELLS
+
+
 def screenshots_dir():
     if os.environ.get("GDPNOW_OUTPUT_DIR"):
         return os.environ["GDPNOW_OUTPUT_DIR"]
