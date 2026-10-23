@@ -105,6 +105,7 @@ const S = {
   state: null, scan: null,
   master_type: 'RC', cols: 2, rows: 2, cycle: 1, interval: 15, minutes: 5, monitor: 1,
   cursor: 0, polling: null, running: false, lastAnswers: null, sessionDir: null,
+  picks: [],  // episodes to play first (like `gdpnow 257`)
 };
 
 /* ---------------------------------------------------------- steppers */
@@ -220,6 +221,63 @@ function renderGridPick() {
   $('#grid-label').textContent = `${S.cols} × ${S.rows}`;
 }
 
+/* ------------------------------------------------- episodes to play first */
+// Same matching as the player (gdpnow_support._episode_id): 257 = 0257, D6 = D06.
+const episodeId = (text) => {
+  const t = String(text).trim().replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+  let m = /^0*(\d+)(\+?)$/.exec(t);
+  if (m) return (m[1] || '0') + m[2];
+  m = /^d0*(\d+)$/.exec(t);
+  return m ? 'd' + m[1] : t;
+};
+const findEpisode = (text) => ((S.scan && S.scan.episodes) || []).find((e) => episodeId(e.label) === episodeId(text));
+
+function addPick(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return;
+  for (const part of raw.split(/[\s,;]+/).filter(Boolean)) {
+    const ep = findEpisode(part);
+    if (!ep) { toast(`Episode ${part} is not in your video folder (or not in the map).`, 'err'); continue; }
+    if (S.picks.includes(ep.label)) continue;
+    S.picks.push(ep.label);
+  }
+  $('#pick-input').value = '';
+  render();
+}
+
+/* Where each pick lands, mirroring the player: picks without times for the
+   chosen scene are skipped; the rest fill cells 1..N, then the next turns. */
+function pickPlan() {
+  const p = plan();
+  const usable = [];
+  const rows = S.picks.map((label) => {
+    const ep = findEpisode(label);
+    if (!ep || !ep.types.includes(S.master_type)) return { label, note: `no ${S.master_type} times, skipped`, bad: true };
+    const i = usable.length;
+    usable.push(label);
+    if (i >= p.grid * p.cycle) return { label, note: 'does not fit (more picks than slots)', bad: true };
+    const cell = (i % p.grid) + 1, turn = Math.floor(i / p.grid) + 1;
+    return { label, note: p.cycling && turn > 1 ? `cell ${cell}, turn ${turn}` : `cell ${cell}`, bad: false };
+  });
+  return { rows, firstInCell: usable.slice(0, p.grid) };
+}
+
+function renderPicks() {
+  const dl = $('#pick-options');
+  const eps = ((S.scan && S.scan.episodes) || []).filter((e) => e.types.includes(S.master_type) && !S.picks.includes(e.label));
+  dl.innerHTML = '';
+  eps.map((e) => e.label).sort(typeof compareEpisodes === 'function' ? compareEpisodes : undefined)
+    .forEach((l) => dl.append(el('option', { value: l })));
+  const box = $('#picks');
+  box.innerHTML = '';
+  for (const r of pickPlan().rows) {
+    box.append(el('span', { class: 'pick' + (r.bad ? ' bad' : '') }, r.label,
+      el('span', { class: 'slot' }, r.note),
+      el('button', { title: 'Remove', onclick: () => { S.picks = S.picks.filter((x) => x !== r.label); render(); } }, '×')));
+  }
+  $('#pick-clear').classList.toggle('hidden', !S.picks.length);
+}
+
 /* The player's own numbers (play_videos / cycle_videos), shown before starting. */
 function plan() {
   const grid = S.cols * S.rows;
@@ -275,10 +333,12 @@ function renderPreview() {
   g.style.gridTemplateRows = `repeat(${S.rows}, 1fr)`;
   g.innerHTML = '';
   const filled = p.n === null ? p.grid : Math.min(p.grid, p.n);
+  const firstInCell = pickPlan().firstInCell;
   for (let i = 0; i < p.grid; i++) {
     const on = i < filled;
     const dots = on && p.cycling && p.grid <= 36 ? Array.from({ length: Math.min(p.cycle, 6) }, () => el('i')) : [];
     g.append(el('div', { class: 'scell', style: on ? '' : 'background:rgba(255,255,255,.03)' },
+      firstInCell[i] && p.grid <= 36 ? el('span', { class: 'pickname', title: 'Picked: plays first in this cell' }, firstInCell[i]) : null,
       p.grid <= 64 ? el('span', { class: 'num' }, on ? String(i + 1) : '') : null,
       dots.length ? el('div', { class: 'stack' }, dots) : null));
   }
@@ -288,6 +348,7 @@ function renderPreview() {
     el('span', { class: 'chip' }, el('b', {}, S.master_type)),
     el('span', { class: 'chip' }, el('b', {}, `${S.cols}×${S.rows}`), ` · ${p.grid} cell${p.grid === 1 ? '' : 's'}`),
     el('span', { class: 'chip' }, p.cycling ? `${p.intervals} scenes · ${S.minutes} min` : 'no rotation'),
+    ...(S.picks.length ? [el('span', { class: 'chip' }, el('b', {}, String(S.picks.length)), ` picked`)] : []),
   );
   const ready = S.state.video_dir && S.scan && !S.scan.error && p.n > 0;
   $('#btn-start').disabled = !ready || S.running;
@@ -301,6 +362,7 @@ function render() {
   if (!S.state) return;
   renderLibrary();
   renderPills();
+  renderPicks();
   renderMonitors();
   renderGridPick();
   renderRotation();
@@ -310,7 +372,7 @@ function render() {
 /* --------------------------------------------------------- session */
 async function startSession() {
   const answers = { master_type: S.master_type, cols: S.cols, rows: S.rows, cycle: S.cycle,
-    interval: S.interval, minutes: S.minutes, monitor: S.monitor };
+    interval: S.interval, minutes: S.minutes, monitor: S.monitor, episodes: S.picks };
   const res = await call('start', answers);
   if (res && res.error) { toast(res.error, 'err'); return; }
   S.running = true; S.cursor = 0; S.sessionDir = null; S.lastAnswers = answers;
@@ -419,6 +481,14 @@ async function init() {
   $('#btn-pick-empty').onclick = pickFolder;
   $('#btn-rescan').onclick = () => rescan(true);
   $('#btn-start').onclick = startSession;
+  const pickInput = $('#pick-input');
+  pickInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addPick(pickInput.value); } });
+  // clicking a suggestion adds it right away (typing waits for Enter)
+  pickInput.addEventListener('input', (e) => {
+    const picked = !e.inputType || e.inputType === 'insertReplacementText';
+    if (picked && [...$('#pick-options').options].some((o) => o.value === pickInput.value)) addPick(pickInput.value);
+  });
+  $('#pick-clear').onclick = () => { S.picks = []; render(); };
   $('#btn-stop').onclick = async () => { $('#btn-stop').disabled = true; await call('stop'); toast('Stopping and saving…'); };
   $('#btn-open-session').onclick = () => call('open_path', S.sessionDir);
   $('#btn-make-video').onclick = async () => {

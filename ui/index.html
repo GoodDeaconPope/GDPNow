@@ -74,6 +74,18 @@
           </div>
 
           <div class="card">
+            <div class="card-head"><svg><use href="#i-play"/></svg><span class="label">Episodes</span><span class="grow"></span>
+              <span class="hint">optional: these play first, the rest are random</span></div>
+            <div class="pick-row">
+              <div class="search pick-input"><svg><use href="#i-search"/></svg>
+                <input id="pick-input" list="pick-options" placeholder="Episode number, e.g. 257, then Enter" autocomplete="off"></div>
+              <button class="btn small ghost hidden" id="pick-clear">Clear</button>
+            </div>
+            <datalist id="pick-options"></datalist>
+            <div class="picks" id="picks"></div>
+          </div>
+
+          <div class="card">
             <div class="card-head"><svg><use href="#i-grid"/></svg><span class="label">Layout</span></div>
             <div class="layout-cols">
               <div>

@@ -1116,6 +1116,11 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
         # No personal mpv scripts in the grid (keys are off there anyway): a
         # user script that shells out flashes a cmd window per call per cell.
         f"--load-scripts=no "
+        # Start each scene at the nearest keyframe instead of decoding forward
+        # to the exact second: these files have a keyframe every ~1 s, so a
+        # scene starts at most ~1 s early, and a 2x2 grid shows all its
+        # pictures in ~1-2 s instead of ~3 s (measured). Switches get faster too.
+        f"--hr-seek=no "
     )
 
     # Only add interpolation if enabled
@@ -1175,6 +1180,10 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
     socket_params = f"--input-ipc-server=mpvsocket{socket_index} "
 
     # Assemble the command
+    if os.environ.get("GDPNOW_MPV_LOG_DIR"):  # diagnostics: one timestamped log per mpv
+        pc_parameters += f'--log-file="{os.path.join(os.environ["GDPNOW_MPV_LOG_DIR"], f"mpv{socket_index}.log")}" '
+    if os.environ.get("GDPNOW_MPV_EXTRA"):  # diagnostics: try extra mpv options
+        pc_parameters += os.environ["GDPNOW_MPV_EXTRA"] + " "
     place = f"--wid={int(wid)}" if wid else f"--geometry={geometry}"
     command = f"{place} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
     # print(f"Generated Command (Socket {socket_index}): {command}") # Debug print
@@ -1286,17 +1295,15 @@ def prepare_video_list():
     remaining_map = system_file_map.copy() 
 
     for arg in sys.argv[1:]:
-        found_key = None
-        for key in list(remaining_map.keys()):
-            # 'key' might now be a full path like 'E:\1SystemFile\vid.mp4'
-            # 'arg' might be 'vid'. Substring match still works perfectly.
-            if _ps.arg_matches(arg, key): 
-                found_key = key
-                break 
+        # Episode number first (257 = 257.mp4, not 1257 or 2570), then the old
+        # "file name contains the text" match.
+        found_key = _ps.find_arg_key(arg, list(remaining_map.keys()))
 
         if found_key:
             args_file_map[found_key] = remaining_map.pop(found_key)
             print(f"Prioritizing video '{os.path.basename(found_key)}' based on argument '{arg}'.")
+        else:
+            print(f"No video matches '{arg}' (not in your folder, or not in the map).")
 
     # Shuffle the remaining
     shuffled_items = list(remaining_map.items())

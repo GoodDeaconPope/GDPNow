@@ -440,10 +440,33 @@ def label_for(path):
     return _labels.get(path) or os.path.splitext(os.path.basename(path))[0]
 
 
+def _episode_id(text):
+    """'330', '0330', '330.mp4' -> '330'; 'd6', 'D06' -> 'd6'; else lower-case text."""
+    t = os.path.splitext(str(text).strip())[0].lower()
+    m = re.fullmatch(r"0*(\d+)(\+?)", t)
+    if m:
+        return (m.group(1) or "0") + m.group(2)
+    m = re.fullmatch(r"d0*(\d+)", t)
+    return f"d{m.group(1)}" if m else t
+
+
+def find_arg_key(arg, keys):
+    """The video a 'play this first' argument means (gdpnow 257, or episodes
+    picked in the app): the episode with that number, else (old behaviour)
+    the first file whose name contains the text."""
+    want = _episode_id(arg)
+    for key in keys:
+        if _episode_id(label_for(key)) == want:
+            return key
+    for key in keys:
+        if str(arg) in os.path.basename(key):
+            return key
+    return None
+
+
 def arg_matches(arg, path):
-    """Command-line 'play this one first' arguments ('330', '330.mp4')."""
-    a = os.path.splitext(arg)[0].lower()
-    return a == label_for(path).lower() or arg in os.path.basename(path)
+    """Kept for compatibility: does this argument point at this video?"""
+    return find_arg_key(arg, [path]) is not None
 
 
 def load_matched_map():

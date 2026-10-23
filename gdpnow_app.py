@@ -38,7 +38,7 @@ def _mmss(sec):
 class Session:
     """One running player child process and its log."""
 
-    def __init__(self, answers):
+    def __init__(self, answers, first_episodes=()):
         self.lines = []
         self.lock = threading.Lock()
         self.session_dir = None
@@ -54,7 +54,9 @@ class Session:
             json.dump(answers, f)
         env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
         self.proc = subprocess.Popen(
-            [ps.PYTHON_EXE, "-u", "-W", "ignore::SyntaxWarning", PLAYER, "--answers", self.answers_file],
+            # first_episodes work like `gdpnow 257 330`: those play first
+            [ps.PYTHON_EXE, "-u", "-W", "ignore::SyntaxWarning", PLAYER, "--answers", self.answers_file]
+            + list(first_episodes),
             cwd=ps.ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, env=env, creationflags=NO_WINDOW)
         threading.Thread(target=self._read, daemon=True).start()
@@ -184,11 +186,14 @@ class Api:
             out["orphans"] = [{"label": g, "path": p} for p, g in sorted(not_in_map, key=lambda x: x[1])]
             out["dupes"] = len(dupes)
             out["files"] = chosen
+            episodes = []
             for key in chosen:
                 meta = system_map.get(key) or {}
-                for t in SCENE_TYPES:
-                    if t in meta:
-                        out["type_counts"][t] += 1
+                types = [t for t in SCENE_TYPES if t in meta]
+                for t in types:
+                    out["type_counts"][t] += 1
+                episodes.append({"label": os.path.splitext(key)[0], "types": types})
+            out["episodes"] = episodes  # what can be picked to play first
         return out
 
     def set_subfolders(self, on):
@@ -218,7 +223,10 @@ class Api:
         s = ps.load_settings()
         s["last_answers"] = clean
         ps.save_settings(s)
-        self._session = Session(clean)
+        # episodes to play first (like `gdpnow 257`): plain episode ids only
+        first = [str(e).strip() for e in (answers.get("episodes") or [])
+                 if re.fullmatch(r"[A-Za-z]?\d{1,4}\+?", str(e).strip())]
+        self._session = Session(clean, first)
         return {"ok": True}
 
     def poll(self, cursor=0):
