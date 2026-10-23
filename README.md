@@ -25,6 +25,19 @@ Needs Windows 10 (version 1607 or newer) or Windows 11, 64-bit. The window uses 
 Edge WebView2, which comes with Windows 11 and updated Windows 10; if it is missing,
 GDPNow offers to install it or to use the text version instead.
 
+### macOS
+
+Get `GDPNow-<version>-macos-arm64.zip` for Apple Silicon Macs (M1 and newer, macOS 14 or
+newer) or `GDPNow-<version>-macos-x86_64.zip` for Intel Macs (macOS 15 or newer).
+
+1. Unzip it and drag **GDPNow** into your **Applications** folder.
+2. Open it. GDPNow is not signed with a paid Apple certificate, so the first time macOS
+   says it cannot check it: open **System Settings > Privacy & Security**, scroll down and
+   click **Open Anyway** (on macOS 14 you can also right-click GDPNow and choose **Open**).
+3. Click **Choose video folder** and pick the folder with your videos.
+
+On a Mac each grid cell is its own window: click any cell, then use the keys below.
+
 ## Using it
 
 - **File names:** any name works as long as the episode number is in it: `330.mp4`,
@@ -92,6 +105,11 @@ Produces `build\dist\GDPNow-1.0.0-windows-x64.zip`: the code from this repo plus
 embeddable Python 3.12 with its libraries, mpv, FFmpeg, Microsoft's WebView2 installer and
 `GDPNow.exe` (compiled from `release\launcher\GDPNow.cs` with the C# compiler built into
 Windows). The downloads it needs are listed at the top of `release\build_release.py`.
+
+The macOS app is built on a Mac by `release/build_macos.py` (Python 3.12 from
+python-build-standalone, mpv's macOS build, a static FFmpeg; every download is checksum
+checked). The **macOS app** workflow in GitHub Actions builds it for Apple Silicon and Intel
+and smoke-tests it with generated test-pattern videos (`release/tests/mac_smoke.py`).
 
 ## Layout
 
