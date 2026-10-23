@@ -555,6 +555,22 @@ def _ensure_webview2():
     return False
 
 
+def _unblock_downloaded_dlls():
+    """Extract All on a downloaded zip marks every file as from the internet
+    (a Zone.Identifier stream), and .NET then refuses to load the window's
+    DLLs: "Failed to resolve Python.Runtime.Loader.Initialize". Drop the mark
+    from the bundled DLLs (23 files, ~0.01 s)."""
+    if not ps.PORTABLE:
+        return
+    for root, _, files in os.walk(os.path.join(ps.RUNTIME, "python")):
+        for f in files:
+            if f.lower().endswith(".dll"):
+                try:
+                    os.remove(os.path.join(root, f) + ":Zone.Identifier")
+                except OSError:
+                    pass  # not marked, or a read-only folder
+
+
 def main():
     global _window
     try:
@@ -565,6 +581,7 @@ def main():
         return
     if os.environ.get("GDPNOW_TEST_CRASH") == "app":
         raise RuntimeError("test crash requested with GDPNOW_TEST_CRASH=app")
+    _unblock_downloaded_dlls()
     import webview
     webview.settings["SHOW_DEFAULT_MENUS"] = False  # no browser right-click menu
     if os.environ.get("GDPNOW_DEBUG_PORT"):
