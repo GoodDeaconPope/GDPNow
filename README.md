@@ -6,6 +6,10 @@ screenshots and a script that turns the session into one grid video.
 Windows only. Playback runs on [mpv](https://mpv.io); the session video is built with
 [FFmpeg](https://ffmpeg.org).
 
+![New session: library, scene, picked episodes, grid preview](docs/screenshots/play.png)
+
+![Episode map editor: scenes of one episode on a timeline](docs/screenshots/episode-map.png)
+
 ## Download
 
 Get `GDPNow-<version>-windows-x64.zip` from [Releases](../../releases). It contains
