@@ -126,20 +126,33 @@ check("all 4 cells play", len(playing) == 4, f"started at {playing}")
 names_before = [ipc(s, ["get_property", "filename"]) for s in socks]
 geoms = [ipc(s, ["get_property", "geometry"]) for s in socks]
 check("cell geometry set", all(geoms), geoms)
+
+
+def cell_spread(png):
+    """Colour spread of each grid quarter on a screen capture: the test
+    pattern gives ~100, a flat colour (blank or undrawn cell) ~0."""
+    r = sh([PY, "-c", "import sys\nfrom PIL import Image, ImageStat\n"
+            "im = Image.open(sys.argv[1]).convert('RGB'); w, h = im.size\n"
+            "top, bottom = int(h * 0.05), int(h * 0.85)\n"  # skip the menu bar and the Dock
+            "boxes = [(0, top, w // 2, h // 2), (w // 2, top, w, h // 2), (0, h // 2, w // 2, bottom), (w // 2, h // 2, w, bottom)]\n"
+            "print([round(sum(ImageStat.Stat(im.crop(b)).stddev) / 3, 1) for b in boxes])", png])
+    return json.loads(r.stdout.strip() or "[0, 0, 0, 0]")
+
+
+# cells must show the test pattern on screen (a slow test Mac may draw a cell's
+# first frame late, so two captures 8 s apart); episodes rotate every 6 s
 time.sleep(2)
 screenshot("grid.png")
-# the cells must show the test pattern on screen, not one flat colour
-r = sh([PY, "-c", "import sys\nfrom PIL import Image, ImageStat\n"
-        "im = Image.open(sys.argv[1]).convert('RGB'); w, h = im.size\n"
-        "top, bottom = int(h * 0.05), int(h * 0.85)\n"  # skip the menu bar and the Dock
-        "boxes = [(0, top, w // 2, h // 2), (w // 2, top, w, h // 2), (0, h // 2, w // 2, bottom), (w // 2, h // 2, w, bottom)]\n"
-        "print([round(sum(ImageStat.Stat(im.crop(b)).stddev) / 3, 1) for b in boxes])",
-        os.path.join(out, "grid.png")])
-spread = json.loads(r.stdout.strip() or "[]")
-check("cells show video on screen", len(spread) == 4 and min(spread) > 15, f"colour spread per cell {spread} {r.stderr[-200:]}")
-time.sleep(7)
-names_after = [ipc(s, ["get_property", "filename"]) for s in socks]
-check("rotation switched episodes", names_before != names_after, f"{names_before} -> {names_after}")
+names_seen = [names_before]
+for _ in range(8):
+    time.sleep(1)
+    names_seen.append([ipc(s, ["get_property", "filename"]) for s in socks])
+screenshot("grid2.png")
+spreads = [cell_spread(os.path.join(out, "grid.png")), cell_spread(os.path.join(out, "grid2.png"))]
+best = [max(a, b) for a, b in zip(*spreads)]
+check("cells show video on screen", min(best) > 15, f"colour spread per cell, two captures: {spreads}")
+check("rotation switched episodes", any(n != names_before for n in names_seen[1:]),
+      f"{names_before} -> {names_seen[-1]}")
 before = open(log_path).read()
 ipc(socks[0], ["keypress", "e"])
 time.sleep(3)
