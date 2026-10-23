@@ -28,6 +28,8 @@ GDPNow offers to install it or to use the text version instead.
   lists which file matched which episode.
 - **Session:** pick a scene type, a screen, a grid (columns x rows), how many episodes
   take turns in each cell, how often they switch and for how long, then **Start**.
+- **Episodes (optional):** type episode numbers to play first, like `gdpnow 257 330` on
+  the command line; the preview shows which cell each one starts in, the rest are random.
 - **While it plays:**
 
   | Key | Action |
