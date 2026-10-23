@@ -376,11 +376,14 @@ def _enum_windows_for_pids(pid_list, grid_size, max_wait=20.0, interval=0.05):
     deadline = time.time() + max_wait
     attempt = 0
 
-    # --- Primary search: by PID ---
+    # --- Search by PID (only windows of the mpv processes we started) ---
+    last_found = -1
     while time.time() < deadline and len(pid_to_hwnd) < grid_size:
         attempt += 1
         win32gui.EnumWindows(pid_callback, None)
-        print(f"GridHost: PID search attempt {attempt}, found {len(pid_to_hwnd)}/{grid_size}")
+        if len(pid_to_hwnd) != last_found:
+            last_found = len(pid_to_hwnd)
+            print(f"GridHost: PID search attempt {attempt}, found {last_found}/{grid_size}")
         if len(pid_to_hwnd) >= grid_size:
             break
         time.sleep(interval)
@@ -393,39 +396,10 @@ def _enum_windows_for_pids(pid_list, grid_size, max_wait=20.0, interval=0.05):
 
     print(f"GridHost: Ordered HWNDs (matching pid_list): {ordered_hwnds}")
 
-    # --- Fallback search: by class/title, ONLY if still short ---
-    # These appended extras have unknown socket binding, but that's the
-    # last resort — they get tacked on at the end so pid-matched ones
-    # keep their correct positions.
+    # No fallback by window class/title: that could grab mpv windows the
+    # user has open for other things. Missing cells just stay out of the grid.
     if len(ordered_hwnds) < grid_size:
-        extra_hwnds = []
-
-        def fallback_callback(hwnd, extra):
-            if len(ordered_hwnds) + len(extra_hwnds) >= grid_size:
-                return
-            if not win32gui.IsWindowVisible(hwnd):
-                return
-            try:
-                cls = win32gui.GetClassName(hwnd)
-                title = win32gui.GetWindowText(hwnd)
-            except Exception:
-                return
-            title_l = title.lower()
-            looks_like_mpv = (
-                cls.lower() == "mpv"
-                or ".mp4" in title_l
-                or "mpv" in title_l
-            )
-            if looks_like_mpv and hwnd not in ordered_hwnds and hwnd not in extra_hwnds:
-                extra_hwnds.append(hwnd)
-
-        win32gui.EnumWindows(fallback_callback, None)
-        if extra_hwnds:
-            print(f"GridHost: Fallback HWNDs by class/title: {extra_hwnds}")
-            for h in extra_hwnds:
-                if len(ordered_hwnds) >= grid_size:
-                    break
-                ordered_hwnds.append(h)
+        print(f"GridHost: WARNING only {len(ordered_hwnds)}/{grid_size} mpv windows appeared in time.")
 
     # Final trim (safety)
     if len(ordered_hwnds) > grid_size:
@@ -862,6 +836,64 @@ def _create_grid_host_window(config):
 
 
 
+def _create_grid_cells(host_hwnd, count):
+    """One black child window per grid cell; each mpv draws inside its cell
+    (--wid), so mpv never opens a window of its own."""
+    import win32api
+    import win32con
+    import win32gui
+
+    class_name = "GridCellWindowClass"
+    if not hasattr(_create_grid_cells, "_atom"):
+        wc = win32gui.WNDCLASS()
+        wc.hInstance = win32gui.GetModuleHandle(None)
+        wc.lpszClassName = class_name
+        wc.lpfnWndProc = lambda h, m, w, l: win32gui.DefWindowProc(h, m, w, l)
+        wc.hbrBackground = win32gui.GetStockObject(win32con.BLACK_BRUSH)
+        wc.hCursor = win32api.LoadCursor(0, win32con.IDC_ARROW)
+        _create_grid_cells._atom = win32gui.RegisterClass(wc)
+    cells = []
+    for _ in range(count):
+        cells.append(win32gui.CreateWindowEx(
+            0, class_name, "", win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_CLIPCHILDREN,
+            0, 0, 10, 10, host_hwnd, 0, win32gui.GetModuleHandle(None), None))
+    return cells
+
+
+def _start_grid_host_with_cells(config, timeout=5.0):
+    """Create and show the GridHost window with one cell per video on its own
+    thread (which then runs the window's message loop). Returns the cell
+    HWNDs to hand to mpv as --wid, or None (then mpv opens its own windows
+    and GridHost adopts them afterwards, the old way)."""
+    grid_size = config.column_grid * config.row_grid
+    if grid_size <= 0:
+        return None
+    ready = threading.Event()
+    result = {}
+
+    def run():
+        import win32gui, win32con
+        try:
+            host_hwnd = _create_grid_host_window(config)
+            cells = _create_grid_cells(host_hwnd, grid_size)
+            _attach_children_to_host(host_hwnd, cells, config)
+            win32gui.ShowWindow(host_hwnd, win32con.SW_SHOWNORMAL)
+            win32gui.UpdateWindow(host_hwnd)
+            result["cells"] = cells
+            print(f"GridHost: {grid_size} cells ready, mpv will draw inside them.")
+        except Exception as e:
+            print(f"GridHost: could not create the grid window first ({e}); using separate mpv windows.")
+        finally:
+            ready.set()
+        if "cells" in result:
+            win32gui.PumpMessages()
+            print("GridHost: Message loop exited.")
+
+    threading.Thread(target=run, name="GridHostThread", daemon=True).start()
+    ready.wait(timeout)
+    return result.get("cells")
+
+
 def _attach_children_to_host(host_hwnd, child_hwnds, config):
     """
     Attach mpv windows as WS_CHILD inside GridHost, strip borders,
@@ -894,6 +926,10 @@ def _attach_children_to_host(host_hwnd, child_hwnds, config):
 
             # Reparent mpv into host
             win32gui.SetParent(hwnd, host_hwnd)
+            # mpv started minimized (no loose windows during startup):
+            # restore it now, inside the host, which is not shown yet.
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
             style = win32gui.GetWindowLong(hwnd, GWL_STYLE)
             style &= ~(WS_CAPTION | WS_THICKFRAME)
@@ -952,7 +988,9 @@ def _grid_host_thread(config, mpv_pids):
             print("GridHost: grid_size <= 0, nothing to host.")
             return
 
-        child_hwnds = _enum_windows_for_pids(mpv_pids, grid_size=grid_size, max_wait=5.0, interval=0.2)
+        # mpv only creates its window once the video opens, which can take a
+        # while on a slow disk: wait up to 30 s for OUR windows.
+        child_hwnds = _enum_windows_for_pids(mpv_pids, grid_size=grid_size, max_wait=30.0, interval=0.1)
         if not child_hwnds:
             print("GridHost: Could not find any MPV HWNDs.")
             return
@@ -1059,8 +1097,9 @@ class VideoPlayerConfig:
             self.default_duration_map[key] = self.interval_cycle
 
 
-def create_mpv_command(video_file, start_time, geometry, config, socket_index):
-    """Creates the MPV command string."""
+def create_mpv_command(video_file, start_time, geometry, config, socket_index, wid=None):
+    """Creates the MPV command string. With wid (a GridHost cell window),
+    mpv draws inside that cell instead of opening its own window."""
     # Base parameters.
     # --input-default-bindings=no + --input-vo-keyboard=no disable ALL of
     # MPV's built-in keyboard handling. This stops MPV from reacting to
@@ -1074,6 +1113,9 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index):
         f"--no-border --video-sync=display-resample --keepaspect "
         f"--no-keepaspect-window --panscan=1 "
         f"--input-default-bindings=no --input-vo-keyboard=no "
+        # No personal mpv scripts in the grid (keys are off there anyway): a
+        # user script that shells out flashes a cmd window per call per cell.
+        f"--load-scripts=no "
     )
 
     # Only add interpolation if enabled
@@ -1126,14 +1168,15 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index):
         pc_parameters += "--brightness=6 --gamma=7 "
 
     # For single video mode, add fullscreen flag
-    if config.column_grid == 1 and config.row_grid == 1:
+    if config.column_grid == 1 and config.row_grid == 1 and not wid:
         pc_parameters += "--fs "
 
     # IPC socket parameter using the provided index
     socket_params = f"--input-ipc-server=mpvsocket{socket_index} "
 
     # Assemble the command
-    command = f"--geometry={geometry} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
+    place = f"--wid={int(wid)}" if wid else f"--geometry={geometry}"
+    command = f"{place} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
     # print(f"Generated Command (Socket {socket_index}): {command}") # Debug print
     # Use shlex for proper quoting, especially for filenames with spaces
     # Ensure quotes around video_file are handled correctly by shlex if needed, but usually better handled by Popen directly if command is passed as list
@@ -2960,6 +3003,9 @@ def play_videos(config, video_list):
         etc = "..." if video_count > 3 else ""
         print(f"  Socket Index {k}: {video_count} videos assigned. (e.g., {video_names}{etc})")
 
+    # --- GridHost first: its cells are where each mpv will draw (--wid) ---
+    grid_cells = _start_grid_host_with_cells(config) if config.production else None
+
     # --- Calculate Durations and Start Initial MPV Instances ---
     print("\nCalculating durations and starting initial MPV instances...")
     successful_starts = 0
@@ -2992,7 +3038,8 @@ def play_videos(config, video_list):
                     print(f"      Error calculating duration for video {filename} on socket {i}: {e}")
                     metadata["videoTime"] = config.default_duration_map.get(config.master_type, 60)
 
-        command_list = create_mpv_command(first_filename, first_start_time_str, geometry, config, i)
+        command_list = create_mpv_command(first_filename, first_start_time_str, geometry, config, i,
+                                          wid=grid_cells[i] if grid_cells else None)
         # Record what this cell is showing for NutCounter label overlay
         # and GRWM scene history. Pass full metadata so E-key CSP swap
         # can find the CSP time for this video later.
@@ -3045,7 +3092,9 @@ def play_videos(config, video_list):
 
     try:
         mpv_pids = [p.pid for p in processes if p]
-        if mpv_pids:
+        if grid_cells:
+            pass  # mpv already draws inside the GridHost cells
+        elif mpv_pids:
             host_thread = threading.Thread(
                 target=_grid_host_thread,
                 args=(config, mpv_pids),
