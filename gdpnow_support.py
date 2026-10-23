@@ -18,8 +18,11 @@ import subprocess
 import sys
 import threading
 
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-# release layout: GDPNow\app\ (this file) next to GDPNow\runtime\
+# release layout: GDPNow\app\ (this file) next to GDPNow\runtime\; on macOS
+# GDPNow.app/Contents/Resources/app next to .../Resources/runtime
 PORTABLE = os.path.isdir(os.path.join(os.path.dirname(APP_DIR), "runtime"))
 ROOT = os.path.dirname(APP_DIR) if PORTABLE else APP_DIR
 RUNTIME = os.path.join(ROOT, "runtime")
@@ -28,34 +31,107 @@ RUNTIME = os.path.join(ROOT, "runtime")
 def _tool(bundled, name):
     if PORTABLE and os.path.isfile(bundled):
         return bundled
-    # ask for name.exe: Python's PATH search also looks in the current folder,
-    # where an unrelated file called just "mpv" must not win
-    return (shutil.which(name + ".exe") or shutil.which(name + ".com")
-            or (bundled if os.path.isfile(bundled) else name))
+    if IS_WIN:
+        # ask for name.exe: Python's PATH search also looks in the current
+        # folder, where an unrelated file called just "mpv" must not win
+        found = shutil.which(name + ".exe") or shutil.which(name + ".com")
+    else:
+        found = shutil.which(name)
+    return found or (bundled if os.path.isfile(bundled) else name)
 
 
-MPV_EXE = _tool(os.path.join(RUNTIME, "mpv", "mpv.exe"), "mpv")
-FFMPEG_EXE = _tool(os.path.join(RUNTIME, "ffmpeg", "ffmpeg.exe"), "ffmpeg")
+if IS_WIN:
+    MPV_EXE = _tool(os.path.join(RUNTIME, "mpv", "mpv.exe"), "mpv")
+    FFMPEG_EXE = _tool(os.path.join(RUNTIME, "ffmpeg", "ffmpeg.exe"), "ffmpeg")
+else:
+    MPV_EXE = _tool(os.path.join(RUNTIME, "mpv", "mpv.app", "Contents", "MacOS", "mpv"), "mpv")
+    FFMPEG_EXE = _tool(os.path.join(RUNTIME, "ffmpeg", "ffmpeg"), "ffmpeg")
 if PORTABLE:
-    PYTHON_EXE = os.path.join(RUNTIME, "python", "python.exe")
-else:  # the Python running us; python.exe (console), not pythonw.exe
+    PYTHON_EXE = os.path.join(RUNTIME, "python", "python.exe" if IS_WIN else "bin/python3")
+elif IS_WIN:  # the Python running us; python.exe (console), not pythonw.exe
     _py = os.path.join(os.path.dirname(sys.executable), "python.exe")
     PYTHON_EXE = _py if os.path.isfile(_py) else sys.executable
+else:
+    PYTHON_EXE = sys.executable
 DEFAULT_MAP_FILE = os.path.join(APP_DIR, "systemFileMap.json")
 # settings, the matching report and error reports: next to the launcher in the
-# release; in the user's AppData when running from the repo (keeps it clean)
-STATE_DIR = ROOT if PORTABLE else os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GDPNow")
+# Windows release; in the user's AppData when running from the repo (keeps it
+# clean); on macOS always in ~/Library/Application Support (an app bundle is
+# read-only when macOS runs a downloaded app from a temporary copy)
+if IS_WIN:
+    STATE_DIR = ROOT if PORTABLE else os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "GDPNow")
+else:
+    STATE_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "GDPNow")
 REPORT_FILE = os.path.join(STATE_DIR, "video_matches.txt")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".wmv", ".webm",
               ".ts", ".m2ts", ".flv", ".mpg", ".mpeg"}
 
-_WINDIR = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
-FONT_CANDIDATES = (os.path.join(_WINDIR, "Fonts", "arialbd.ttf"),
-                   os.path.join(_WINDIR, "Fonts", "arial.ttf"))
+if IS_WIN:
+    _WINDIR = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    FONT_CANDIDATES = (os.path.join(_WINDIR, "Fonts", "arialbd.ttf"),
+                       os.path.join(_WINDIR, "Fonts", "arial.ttf"))
+else:
+    FONT_CANDIDATES = tuple(p for p in ("/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                                        "/Library/Fonts/Arial Bold.ttf",
+                                        "/System/Library/Fonts/Supplemental/Arial.ttf",
+                                        "/System/Library/Fonts/Helvetica.ttc")
+                            if os.path.isfile(p)) or ("/System/Library/Fonts/Helvetica.ttc",)
 # ffmpeg filter syntax: forward slashes, drive colon escaped ("C\:/Windows/...")
 FFMPEG_FONT = FONT_CANDIDATES[0].replace("\\", "/").replace(":", "\\:", 1)
+
+
+def ipc_server_arg(name):
+    """mpv --input-ipc-server value: a named pipe on Windows, a Unix socket
+    in a per-user folder elsewhere."""
+    if IS_WIN:
+        return name
+    folder = os.path.join("/tmp", f"gdpnow-{os.getuid()}")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    return os.path.join(folder, name)
+
+
+def ipc_path(name):
+    """The path a client opens to talk to mpv's --input-ipc-server=name."""
+    return rf"\\.\pipe\{name}" if IS_WIN else ipc_server_arg(name)
+
+
+class UnixIpc:
+    """Blocking connection to an mpv Unix socket with the small file-like
+    surface the player uses (write / read / close)."""
+
+    def __init__(self, path, timeout=None):
+        import socket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        try:
+            self.sock.connect(path)
+        except OSError:
+            self.sock.close()
+            raise
+        self.sock.settimeout(None)
+
+    def write(self, data):
+        self.sock.sendall(data)
+
+    def read(self, n=4096):
+        return self.sock.recv(n)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def open_path(path):
+    """Show a file or folder the way the desktop does (Explorer / Finder)."""
+    if IS_WIN:
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open", path])
+
 
 _CHOOSE_FLAGS = ("--choose-folder", "--change-folder")
 _choose_requested = any(a.lower() in _CHOOSE_FLAGS for a in sys.argv[1:])
@@ -124,6 +200,8 @@ def _settings_path():
                     f.write("ok")
                 os.remove(probe)
             except OSError:
+                if not IS_WIN:
+                    raise  # ~/Library/Application Support is always writable
                 base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
                 STATE_DIR = os.path.join(base, "GDPNow")
                 os.makedirs(STATE_DIR, exist_ok=True)
@@ -152,8 +230,16 @@ def save_settings(data):
 
 # ------------------------------------------------------------ folder picker
 def _pick_folder_dialog(title):
-    """Windows folder picker (the modern Explorer-style one). Returns a
-    path or None if cancelled / unavailable."""
+    """Windows folder picker (the modern Explorer-style one), Finder's on
+    macOS. Returns a path or None if cancelled / unavailable."""
+    if not IS_WIN:
+        try:
+            r = subprocess.run(["osascript", "-e", "on run argv",
+                                "-e", "POSIX path of (choose folder with prompt (item 1 of argv))",
+                                "-e", "end run", title], capture_output=True, text=True)
+            return r.stdout.strip().rstrip("/") or None
+        except Exception:
+            return None
     try:
         return _modern_folder_dialog(title)
     except Exception as e:
@@ -565,21 +651,17 @@ def _output_tail(n=150):
 
 
 def _redact(text):
-    """Hide the Windows user name (paths under the profile folder)."""
+    """Hide the user name (paths under the profile / home folder)."""
     home = os.path.expanduser("~")
+    alias = "%USERPROFILE%" if IS_WIN else "~"
     if home and len(home) > 3:
-        text = re.sub(re.escape(home), "%USERPROFILE%", text, flags=re.I)
-        text = re.sub(re.escape(home.replace("\\", "/")), "%USERPROFILE%", text, flags=re.I)
+        text = re.sub(re.escape(home), alias, text, flags=re.I)
+        text = re.sub(re.escape(home.replace("\\", "/")), alias, text, flags=re.I)
     return text
 
 
-def _system_info():
+def _windows_info():
     lines = []
-    try:
-        with open(os.path.join(APP_DIR, "VERSION.txt"), encoding="utf-8") as f:
-            lines.append("GDPNow: " + f.read().strip())
-    except OSError:
-        lines.append("GDPNow: (no VERSION.txt)")
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
@@ -613,6 +695,22 @@ def _system_info():
         lines.append("Graphics: " + ("; ".join(gpus) or "?"))
     except Exception:
         pass
+    return lines
+
+
+def _system_info():
+    lines = []
+    try:
+        with open(os.path.join(APP_DIR, "VERSION.txt"), encoding="utf-8") as f:
+            lines.append("GDPNow: " + f.read().strip())
+    except OSError:
+        lines.append("GDPNow: (no VERSION.txt)")
+    if IS_WIN:
+        lines.extend(_windows_info())
+    else:
+        import platform
+        lines.append(f"macOS: {platform.mac_ver()[0]} on {platform.machine()} ({_gpu_name()})")
+        lines.append(f"Python: {sys.version.split()[0]}")
     try:
         from screeninfo import get_monitors
         lines.append("Screens: " + "; ".join(f"{m.width}x{m.height} at {m.x},{m.y}"
@@ -679,6 +777,9 @@ def report_error_native(where, details, log_text=""):
         path = save_report(full)
     except Exception:
         path = None
+    if not IS_WIN:
+        _mac_error_dialog(where, short, path)
+        return path
     intro = (f"Something went wrong ({where}).\r\n"
              "Copy the text below (it is already selected: press Ctrl+C) and paste it into the chat."
              + (f"\r\nThe full report is also saved in the \"error reports\" folder as {os.path.basename(path)}."
@@ -686,6 +787,21 @@ def report_error_native(where, details, log_text=""):
     if not _error_dialog(intro, short):
         _error_fallback(where, short, path)
     return path
+
+
+def _mac_error_dialog(where, short, path):
+    """macOS: the system dialog with the report in its text field (selected,
+    Cmd+C copies it) and one OK button."""
+    intro = (f"{SUPPORT_LINE}.\n\nSomething went wrong ({where}). Copy the text in the box "
+             "(it is selected: press Cmd+C) and paste it into the chat."
+             + (f"\nThe full report is also saved in {os.path.dirname(path)}." if path else ""))
+    try:
+        subprocess.run(["osascript", "-e", "on run argv",
+                        "-e", 'display dialog (item 1 of argv) default answer (item 2 of argv) '
+                              'buttons {"OK"} default button 1 with icon stop with title "GDPNow - error"',
+                        "-e", "end run", intro, short], capture_output=True, timeout=3600)
+    except Exception:
+        print(short)
 
 
 def _error_fallback(where, short, path):
@@ -893,7 +1009,14 @@ _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _gpu_name():
-    """The primary display's graphics card, e.g. "NVIDIA GeForce RTX 4070 Ti"."""
+    """The primary display's graphics card, e.g. "NVIDIA GeForce RTX 4070 Ti";
+    on macOS the chip ("Apple M2 Pro"), whose media engine decodes."""
+    if not IS_WIN:
+        try:
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                  capture_output=True, text=True).stdout.strip() or "unknown"
+        except Exception:
+            return "unknown"
     try:
         import win32api
         i = 0
@@ -921,7 +1044,8 @@ def measure_gpu_decode(parallel=4, loops=4):
                        capture_output=True, timeout=120, creationflags=_NOWIN)
         if not os.path.isfile(clip):
             return 0.0
-        cmd = [FFMPEG_EXE, "-nostdin", "-v", "verbose", "-hwaccel", "d3d11va", "-stream_loop", str(loops - 1),
+        hwaccel = "d3d11va" if IS_WIN else "videotoolbox"
+        cmd = [FFMPEG_EXE, "-nostdin", "-v", "verbose", "-hwaccel", hwaccel, "-stream_loop", str(loops - 1),
                "-i", clip, "-f", "null", "-"]
         logs = [os.path.join(tmp, f"dec{k}.log") for k in range(parallel)]
         outs = [open(log, "wb") for log in logs]
@@ -935,7 +1059,7 @@ def measure_gpu_decode(parallel=4, loops=4):
         for p, log in zip(procs, logs):
             # ffmpeg quietly decodes on the CPU when the GPU cannot
             with open(log, "rb") as f:
-                if p.returncode or b"pix_fmt: d3d11" not in f.read():
+                if p.returncode or f"pix_fmt: {'d3d11' if IS_WIN else 'videotoolbox'}".encode() not in f.read():
                     return 0.0
         return parallel * loops * 60 / wall / 30
     except Exception:
@@ -973,11 +1097,13 @@ def gpu_decode_cells(grid_size):
 def screenshots_dir():
     if os.environ.get("GDPNOW_OUTPUT_DIR"):
         return os.environ["GDPNOW_OUTPUT_DIR"]
-    try:
-        from win32com.shell import shell, shellcon
-        pictures = shell.SHGetKnownFolderPath(shellcon.FOLDERID_Pictures, 0, None)
-    except Exception:
-        pictures = os.path.join(os.path.expanduser("~"), "Pictures")
+    pictures = os.path.join(os.path.expanduser("~"), "Pictures")
+    if IS_WIN:
+        try:
+            from win32com.shell import shell, shellcon
+            pictures = shell.SHGetKnownFolderPath(shellcon.FOLDERID_Pictures, 0, None)
+        except Exception:
+            pass
     return os.path.join(pictures, "gdpnow_nuts")
 
 
@@ -990,6 +1116,9 @@ _NVENC_BASIC = ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "15"
                 "-b:v", "30M", "-maxrate", "60M", "-bufsize", "120M", "-bf", "3",
                 "-spatial-aq", "1"]
 _X264 = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+# macOS: the Mac's own hardware encoder
+_VIDEOTOOLBOX = ["-c:v", "h264_videotoolbox", "-b:v", "30M", "-maxrate", "60M", "-bufsize", "120M",
+                 "-allow_sw", "0"]
 _encoder_cache = None
 
 
@@ -1009,13 +1138,16 @@ def video_encoder():
     """('nvenc'|'cpu', ffmpeg video options) for the GRWM video."""
     global _encoder_cache
     if _encoder_cache is None:
-        if _encoder_works(_NVENC_FULL):
+        if not IS_WIN and _encoder_works(_VIDEOTOOLBOX):
+            _encoder_cache = ("videotoolbox", _VIDEOTOOLBOX)
+        elif IS_WIN and _encoder_works(_NVENC_FULL):
             _encoder_cache = ("nvenc", _NVENC_FULL)
-        elif _encoder_works(_NVENC_BASIC):
+        elif IS_WIN and _encoder_works(_NVENC_BASIC):
             _encoder_cache = ("nvenc", _NVENC_BASIC)
         else:
             _encoder_cache = ("cpu", _X264)
-        kind = "NVIDIA GPU (NVENC)" if _encoder_cache[0] == "nvenc" else "CPU (libx264, no NVIDIA GPU found)"
+        kind = {"nvenc": "NVIDIA GPU (NVENC)", "videotoolbox": "the Mac's video encoder (VideoToolbox)"}.get(
+            _encoder_cache[0], "CPU (libx264, no hardware encoder found)")
         print(f"[GRWM] Video encoder: {kind}")
     return _encoder_cache
 
@@ -1025,8 +1157,8 @@ def video_enc_opts_literal():
 
 
 def hwaccel_name():
-    # cuda = NVIDIA decoder; auto = whatever the PC has (Intel/AMD/none)
-    return "cuda" if video_encoder()[0] == "nvenc" else "auto"
+    # cuda = NVIDIA decoder; videotoolbox = the Mac's; auto = whatever the PC has
+    return {"nvenc": "cuda", "videotoolbox": "videotoolbox"}.get(video_encoder()[0], "auto")
 
 
 def python_exe_for_bat():
@@ -1053,10 +1185,14 @@ def session_finished(session_dir):
     _opened_sessions.add(session_dir)
     _session_saved = True
     print(f"\nSession saved to: {session_dir}")
-    print("Double-click run_grwm.bat in that folder to build the grid video (grwm.mp4).")
+    print(f"Double-click {GRWM_RUNNER} in that folder to build the grid video (grwm.mp4).")
     print(f"[GDPNow] SESSION_DIR={session_dir}", flush=True)
     if _answers is None and load_settings().get("open_folder_after_session", PORTABLE):
         try:
-            os.startfile(session_dir)
+            open_path(session_dir)
         except OSError:
             pass
+
+
+# the double-click runner written next to run_grwm.py (Terminal opens a .command)
+GRWM_RUNNER = "run_grwm.bat" if IS_WIN else "run_grwm.command"

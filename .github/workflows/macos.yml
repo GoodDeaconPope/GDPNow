@@ -1,0 +1,49 @@
+# Builds GDPNow.app for Apple Silicon and Intel Macs and smoke-tests it with
+# generated test-pattern videos (release/tests/mac_smoke.py). Run it from the
+# Actions tab; the zips and test screenshots are the run's artifacts.
+name: macOS app
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the app and zip names"
+        required: true
+        default: "1.0.4"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GDPNow.app
+        run: python3 release/build_macos.py --version "${{ inputs.version }}" --arch "${{ matrix.arch }}"
+
+      - name: Smoke test
+        run: python3 release/tests/mac_smoke.py build/mac/GDPNow.app build/mac/smoke
+
+      - name: Upload app and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GDPNow-${{ inputs.version }}-macos-${{ matrix.arch }}
+          path: |
+            build/mac/GDPNow-*.zip
+            build/mac/smoke/*.png
+            build/mac/smoke/*.json
+            build/mac/smoke/*.log
+          if-no-files-found: warn

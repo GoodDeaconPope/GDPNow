@@ -31,22 +31,21 @@ import sys
 # import msvcrt ...
 import json
 import datetime
-import win32pipe, win32file, pywintypes, win32event
 
 import glob
 from pynput.keyboard import Key, Listener
 import os
 import threading
-import win32api
-import win32con
 from screeninfo import get_monitors
 import queue
-import win32process
-import win32gui
-import win32con
 import ctypes
-from ctypes import wintypes
-import win32api
+if _ps.IS_WIN:
+    import win32pipe, win32file, pywintypes, win32event
+    import win32api
+    import win32con
+    import win32process
+    import win32gui
+    from ctypes import wintypes
 
 GWL_WNDPROC = -4
 
@@ -62,13 +61,14 @@ _GRID_HOST_STATE = {}
 
 GWL_WNDPROC = -4
 
-_CHILD_WNDPROC_TYPE = ctypes.WINFUNCTYPE(
-    ctypes.c_long,
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-)
+if _ps.IS_WIN:
+    _CHILD_WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
 
 _CHILD_OLD_PROCS = {}
 _CHILD_CB_PROCS = {}
@@ -237,6 +237,9 @@ class MpvIpcClient:
 
         while time.time() < deadline:
             try:
+                if not _ps.IS_WIN:  # macOS: mpv listens on a Unix socket
+                    self.handle = _ps.UnixIpc(self.pipe_name, timeout=1.0)
+                    break
                 self.handle = win32file.CreateFile(
                     self.pipe_name,
                     win32file.GENERIC_READ | win32file.GENERIC_WRITE,
@@ -247,7 +250,7 @@ class MpvIpcClient:
                     None
                 )
                 break
-            except pywintypes.error as e:
+            except (OSError if not _ps.IS_WIN else pywintypes.error) as e:
                 last_err = e
                 if alive is not None and not alive():
                     break
@@ -269,8 +272,11 @@ class MpvIpcClient:
         try:
             while self.running:
                 try:
-                    hr, data = win32file.ReadFile(self.handle, 4096, None)
-                except pywintypes.error:
+                    if _ps.IS_WIN:
+                        hr, data = win32file.ReadFile(self.handle, 4096, None)
+                    else:
+                        data = self.handle.read(4096)
+                except (OSError, AttributeError) if not _ps.IS_WIN else pywintypes.error:
                     # mpv closed the pipe or some error occurred
                     break
 
@@ -288,18 +294,27 @@ class MpvIpcClient:
                     try:
                         decoded = line.decode("utf-8", errors="ignore")
                         msg = json.loads(decoded)
+                        if msg.get("event") == "client-message" and _mpv_message_handler:
+                            _mpv_message_handler(msg.get("args") or [])
+                            continue
                         self._messages.put(msg)
                     except Exception:
                         # Non-JSON / random noise, ignore
                         pass
         finally:
             self.running = False
-            try:
-                if self.handle is not None:
+            self._close_handle()
+
+    def _close_handle(self):
+        try:
+            if self.handle is not None:
+                if _ps.IS_WIN:
                     win32file.CloseHandle(self.handle)
-            except Exception:
-                pass
-            self.handle = None
+                else:
+                    self.handle.close()
+        except Exception:
+            pass
+        self.handle = None
 
     def send(self, command_str: str):
         """Send a raw mpv command string (plain text mode)."""
@@ -311,7 +326,10 @@ class MpvIpcClient:
 
         data = command_str.encode("utf-8")
         with self.lock:
-            win32file.WriteFile(self.handle, data)
+            if _ps.IS_WIN:
+                win32file.WriteFile(self.handle, data)
+            else:
+                self.handle.write(data)
 
     def send_json(self, obj):
         """Send a JSON mpv command object."""
@@ -328,12 +346,12 @@ class MpvIpcClient:
     def close(self):
         """Stop reader and close the pipe."""
         self.running = False
-        try:
-            if self.handle is not None:
-                win32file.CloseHandle(self.handle)
-        except Exception:
-            pass
-        self.handle = None
+        self._close_handle()
+
+
+# macOS: keys pressed in a grid cell arrive from mpv as client-message events
+# (see mac_keys.lua); set by play_videos, called on the IPC reader threads
+_mpv_message_handler = None
 
 
 
@@ -1026,8 +1044,12 @@ def get_all_monitors():
         'is_primary': monitor.is_primary
     } for i, monitor in enumerate(monitors)]
 
+_selected_screen_index = 0  # 0-based, for mpv --screen on macOS
+
+
 def select_monitor():
     """Allow user to select a monitor. Auto-selects if only one is found."""
+    global _selected_screen_index
     monitors = get_all_monitors()
 
     # Handle case where no monitors are detected
@@ -1057,6 +1079,7 @@ def select_monitor():
             choice = int(input("\nSelect monitor number (1-{}): ".format(len(monitors))))
             if 1 <= choice <= len(monitors):
                 selected = monitors[choice-1]
+                _selected_screen_index = choice - 1
                 # Return width, height, x_offset, y_offset
                 return [selected['width'], selected['height'], selected['x'], selected['y']]
         except ValueError:
@@ -1186,7 +1209,7 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
         pc_parameters += "--fs "
 
     # IPC socket parameter using the provided index
-    socket_params = f"--input-ipc-server=mpvsocket{socket_index} "
+    socket_params = f"--input-ipc-server={_ps.ipc_server_arg(f'mpvsocket{socket_index}')} "
 
     # Assemble the command
     if os.environ.get("GDPNOW_MPV_LOG_DIR"):  # diagnostics: one timestamped log per mpv
@@ -1195,6 +1218,8 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
         pc_parameters += os.environ["GDPNOW_MPV_EXTRA"] + " "
     place = f"--wid={int(wid)}" if wid else f"--geometry={geometry}"
     command = f"{place} {pc_parameters} {performance_params} {socket_params} {ffmpeg_params}"
+    if not _ps.IS_WIN:
+        command += " " + _mac_mpv_params(socket_index, config)
     # print(f"Generated Command (Socket {socket_index}): {command}") # Debug print
     # Use shlex for proper quoting, especially for filenames with spaces
     # Ensure quotes around video_file are handled correctly by shlex if needed, but usually better handled by Popen directly if command is passed as list
@@ -1209,6 +1234,24 @@ def create_mpv_command(video_file, start_time, geometry, config, socket_index, w
          print(f"Command was: {command}")
          # Fallback or re-raise
          return None # Indicate error
+
+
+def _mac_mpv_params(socket_index, config):
+    """macOS: a borderless mpv window per cell, placed by screen percentages
+    (mpv puts a window at x% of the free width, so column c of n is at
+    c/(n-1)); no Retina point/pixel question. Keys pressed in a cell reach
+    the player through mac_keys.lua (no Accessibility permission needed), and
+    the cells get no Dock icons. These come last, so they win."""
+    cols, rows = max(1, config.column_grid), max(1, config.row_grid)
+    col, row = socket_index % cols, socket_index // cols
+    w, h = math.ceil(100 / cols), math.ceil(100 / rows)
+    x = 0 if cols == 1 else round(100 * col / (cols - 1))
+    y = 0 if rows == 1 else round(100 * row / (rows - 1))
+    params = [f"--geometry={w}%x{h}%+{x}%+{y}%", f"--screen={_selected_screen_index}",
+              f"--fs-screen={_selected_screen_index}", "--native-fs=no", "--no-border",
+              "--macos-app-activation-policy=accessory", "--input-vo-keyboard=yes",
+              f"--script={os.path.join(_ps.APP_DIR, 'mac_keys.lua')}"]
+    return " ".join(shlex.quote(p) for p in params)
 
 
 def start_mpv_instance(command_list):
@@ -1242,7 +1285,7 @@ def create_socket(index, retries=100, delay=0.05, process=None, timeout=None):
     waits up to timeout (10 s) while that mpv runs: on a busy PC (cells
     already decoding from a slow drive) mpv's pipe took up to ~5 s (measured).
     """
-    pipe_name = fr'\\.\pipe\mpvsocket{index}'
+    pipe_name = _pipe_name_for(index)
     print(f"Attempting to connect to pipe: {pipe_name}")
     client = MpvIpcClient(pipe_name)
     if timeout is None:
@@ -1549,6 +1592,7 @@ class NutCounter:
         # that window yields a black cell that ends up as the first
         # screenshot in the final selection.
         self._startup_settle_sec = 2.0
+        self._mac_started_at = None
 
     def start(self, fallback_bbox, column_grid=1, row_grid=1):
         """fallback_bbox = (x1, y1, x2, y2) screen coords, used only if the
@@ -1685,6 +1729,8 @@ class NutCounter:
     def _capture_one(self):
         if self.tmp_dir is None:
             return
+        if not _ps.IS_WIN:
+            return self._capture_one_mac()
         bbox = self._get_host_bbox()
         if bbox is not None:
             if not self._host_seen:
@@ -1725,6 +1771,56 @@ class NutCounter:
                 self.captures.append((ts, path))
         except Exception as e:
             print(f"[NutCounter] Capture error: {e}")
+
+    def _capture_one_mac(self):
+        """macOS: each cell's mpv saves what its window shows and the cells are
+        tiled into one grid picture (grabbing the screen would need the Screen
+        Recording permission)."""
+        if self._mac_started_at is None:
+            self._mac_started_at = time.monotonic()
+        if time.monotonic() - self._mac_started_at < self._startup_settle_sec:
+            return
+        cells = [i for i, s in enumerate(sockets) if s is not None]
+        if not cells:
+            return
+        with self.lock:
+            idx = len(self.captures)
+        shots = {i: os.path.join(self.tmp_dir, f"cell_{idx:05d}_{i}.jpg") for i in cells}
+        for i, path in shots.items():
+            _send_fresh(_pipe_name_for(i), json.dumps({"command": ["screenshot-to-file", path, "window"]}),
+                        timeout=2.0)
+        images = {}
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and len(images) < len(shots):
+            for i, path in shots.items():
+                if i in images or not os.path.isfile(path):
+                    continue
+                try:
+                    with Image.open(path) as im:
+                        im.load()  # fails while mpv is still writing it
+                        images[i] = im.convert("RGB")
+                except Exception:
+                    pass
+            time.sleep(0.05)
+        for path in shots.values():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if not images:
+            return
+        cw = max(im.width for im in images.values())
+        ch = max(im.height for im in images.values())
+        grid = Image.new("RGB", (cw * self.column_grid, ch * self.row_grid))
+        for i, im in images.items():
+            if im.size != (cw, ch):
+                im = im.resize((cw, ch))
+            grid.paste(im, ((i % self.column_grid) * cw, (i // self.column_grid) * ch))
+        img = self._annotate(grid)
+        path = os.path.join(self.tmp_dir, f"cap_{idx:05d}.png")
+        img.save(path, "PNG", compress_level=1)
+        with self.lock:
+            self.captures.append((time.time(), path))
 
     def finalize(self):
         """Stop the capture thread, fill to target if short, save final PNGs.
@@ -1845,6 +1941,17 @@ def _send_fresh(pipe_name, cmd_str, timeout=5.0, retries=1):
         result = {"status": None}
         def _inner():
             handle = None
+            if not _ps.IS_WIN:
+                try:
+                    handle = _ps.UnixIpc(pipe_name, timeout=timeout)
+                    handle.write(data)
+                    result["status"] = "ok"
+                except Exception as e:
+                    result["status"] = f"error: {e}"
+                finally:
+                    if handle is not None:
+                        handle.close()
+                return
             try:
                 handle = win32file.CreateFile(
                     pipe_name,
@@ -1894,7 +2001,7 @@ def _send_fresh(pipe_name, cmd_str, timeout=5.0, retries=1):
 
 
 def _pipe_name_for(socket_idx):
-    return rf"\\.\pipe\mpvsocket{socket_idx}"
+    return _ps.ipc_path(f"mpvsocket{socket_idx}")
 
 
 def adjust_panscan(delta):
@@ -2152,6 +2259,8 @@ def _arrow_pan_meaningful():
     """
     if _pan_ref_cell_aspect is None:
         return True  # landscape sentinel: always on
+    if not _ps.IS_WIN:
+        return False  # macOS: no GridHost to resize, cells keep their aspect
     try:
         import win32gui
         if not _GRID_HOST_STATE:
@@ -2880,16 +2989,25 @@ def generate_grwm_script(session_dir):
     # specified." errors. %~dp0 is a runtime wide-char expansion that
     # produces the correct unicode path without appearing in the file
     # source, so the bat file stays ASCII-clean.
-    bat_path = os.path.join(session_dir, "run_grwm.bat")
+    bat_path = os.path.join(session_dir, _ps.GRWM_RUNNER)
     try:
-        with open(bat_path, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
-            f.write("@echo off\r\n")
-            f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(SCENES)} scenes\r\n")
-            f.write("REM %~dp0 = this bat file's own dir, handles unicode paths correctly\r\n")
-            f.write(f"\"{_ps.python_exe_for_bat()}\" \"%~dp0run_grwm.py\"\r\n")
-            f.write("pause\r\n")
+        if _ps.IS_WIN:
+            with open(bat_path, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
+                f.write("@echo off\r\n")
+                f.write(f"REM GRWM grid replay - {cg}x{rg} grid, {len(SCENES)} scenes\r\n")
+                f.write("REM %~dp0 = this bat file's own dir, handles unicode paths correctly\r\n")
+                f.write(f"\"{_ps.python_exe_for_bat()}\" \"%~dp0run_grwm.py\"\r\n")
+                f.write("pause\r\n")
+        else:  # macOS: a .command opens in Terminal on double-click
+            with open(bat_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("#!/bin/bash\n")
+                f.write(f"# GRWM grid replay - {cg}x{rg} grid, {len(SCENES)} scenes\n")
+                f.write('cd "$(dirname "$0")"\n')
+                f.write(f"{shlex.quote(_ps.PYTHON_EXE)} run_grwm.py\n")
+                f.write('read -n 1 -s -r -p "Press any key to close."\n')
+            os.chmod(bat_path, 0o755)
     except OSError as e:
-        print(f"[GRWM] Failed to write bat: {e}")
+        print(f"[GRWM] Failed to write runner: {e}")
 
     # ---- Also write a sequential fallback ffconcat ----
     seq_concat_path = os.path.join(session_dir, "grwm_sequential.ffconcat")
@@ -2932,6 +3050,7 @@ def play_videos(config, video_list):
     global session_crop_width, session_crop_height
     global session_output_w, session_output_h
     global session_panscan, session_panscan_history
+    global _mpv_message_handler
 
     # Snapshot the live crop factors so GRWM can reproduce the same view.
     session_crop_width = float(config.crop_width) if config.crop_width else 0.0
@@ -3024,7 +3143,11 @@ def play_videos(config, video_list):
         print(f"  Socket Index {k}: {video_count} videos assigned. (e.g., {video_names}{etc})")
 
     # --- GridHost first: its cells are where each mpv will draw (--wid) ---
-    grid_cells = _start_grid_host_with_cells(config) if config.production else None
+    # (Windows only: macOS cannot embed another app's window, so there each
+    # mpv is its own borderless window placed on the grid)
+    grid_cells = _start_grid_host_with_cells(config) if config.production and _ps.IS_WIN else None
+    if not _ps.IS_WIN:
+        _mpv_message_handler = _on_mpv_key
 
     # --- Calculate Durations and Start Initial MPV Instances ---
     print("\nCalculating durations and starting initial MPV instances...")
@@ -3129,8 +3252,8 @@ def play_videos(config, video_list):
 
     try:
         mpv_pids = [p.pid for p in processes if p]
-        if grid_cells:
-            pass  # mpv already draws inside the GridHost cells
+        if grid_cells or not _ps.IS_WIN:
+            pass  # mpv already draws inside the GridHost cells / its own windows (macOS)
         elif mpv_pids:
             host_thread = threading.Thread(
                 target=_grid_host_thread,
@@ -3206,7 +3329,12 @@ def play_videos(config, video_list):
 
 
 def run_listener():
-    """Runs the pynput keyboard listener."""
+    """Runs the pynput keyboard listener. macOS: keys come from the grid's mpv
+    windows instead (_on_mpv_key), so this only waits for the session to end."""
+    if not _ps.IS_WIN:
+        print("Keys: click any grid cell, then Q/Esc stop, E CSP, +/- zoom, arrows pan, 0 re-centre.")
+        interrupt_event.wait()
+        return
     with Listener(on_press=on_press, on_release=on_release) as listener:
         print("Keyboard listener started.")
         listener.join() # Blocks until listener stops (returns False from callback)
@@ -3270,8 +3398,6 @@ def cycle_videos(config):
     """
     import math
     import time
-    import win32file
-    import pywintypes
 
     global person_socket_map, interrupt_event
 
@@ -3405,7 +3531,25 @@ def cycle_videos(config):
         if socket_idx in dead_sockets:
             return False
 
-        pipe_name = fr"\\.\pipe\mpvsocket{socket_idx}"
+        pipe_name = _pipe_name_for(socket_idx)
+        if not _ps.IS_WIN:  # macOS: Unix socket
+            if not cmd.endswith("\n"):
+                cmd += "\n"
+            try:
+                conn = _ps.UnixIpc(pipe_name, timeout=5.0)
+            except OSError as e:
+                print(f"    Socket {socket_idx}: Cannot open {pipe_name}: {e}")
+                dead_sockets.add(socket_idx)
+                return False
+            try:
+                conn.write(cmd.encode("utf-8"))
+            except OSError as e:
+                print(f"    Socket {socket_idx}: ERROR writing to {pipe_name}: {e}")
+                dead_sockets.add(socket_idx)
+                return False
+            finally:
+                conn.close()
+            return True
         try:
             handle = win32file.CreateFile(
                 pipe_name,
@@ -3790,6 +3934,22 @@ def on_press(key):
         # If anything goes wrong, still try to force a shutdown.
         force_shutdown_and_exit()
         return False
+
+
+_MAC_SPECIAL_KEYS = {"esc": Key.esc, "left": Key.left, "right": Key.right, "up": Key.up, "down": Key.down}
+
+
+def _on_mpv_key(args):
+    """macOS: mac_keys.lua in each grid mpv sends ["gdpnow-key", name, down|up];
+    hand it to the same handlers the Windows keyboard listener uses."""
+    if len(args) < 2 or args[0] != "gdpnow-key":
+        return
+    name = args[1]
+    key = _MAC_SPECIAL_KEYS.get(name) or type("MpvKey", (), {"char": name})()
+    if len(args) > 2 and args[2] == "up":
+        on_release(key)
+    else:
+        on_press(key)
 
 
 def on_release(key):

@@ -6,6 +6,7 @@ answers, starts gdpnow.py as a child process with --answers, streams its
 log, and stops it through a stop file (same exit path as pressing Q).
 It also hosts the systemFileMap editor.
 """
+import contextlib
 import ctypes
 import json
 import os
@@ -92,7 +93,8 @@ class Api:
         self._scan_lock = threading.Lock()
         self._scan_time = 0.0
         self._preview = None
-        self._preview_pipe = rf"\\.\pipe\gdpnow_preview_{os.getpid()}"
+        self._preview_ipc = ps.ipc_server_arg(f"gdpnow_preview_{os.getpid()}")
+        self._preview_pipe = ps.ipc_path(f"gdpnow_preview_{os.getpid()}")
         self._durations = {}
 
     # ------------------------------------------------------------ state
@@ -205,7 +207,7 @@ class Api:
 
     def open_report(self):
         if os.path.exists(ps.REPORT_FILE):
-            os.startfile(ps.REPORT_FILE)
+            ps.open_path(ps.REPORT_FILE)
 
     # ---------------------------------------------------------- session
     def start(self, answers):
@@ -273,12 +275,13 @@ class Api:
 
     def open_path(self, path):
         if path and os.path.exists(path):
-            os.startfile(path)
+            ps.open_path(path)
 
     def make_video(self, session_dir):
-        bat = os.path.join(session_dir or "", "run_grwm.bat")
-        if os.path.isfile(bat):
-            os.startfile(bat)
+        # run_grwm.bat opens a console; run_grwm.command opens Terminal on macOS
+        runner = os.path.join(session_dir or "", ps.GRWM_RUNNER)
+        if os.path.isfile(runner):
+            ps.open_path(runner)
             return True
         return False
 
@@ -348,7 +351,7 @@ class Api:
                                       "options": f"start={start}"}}) is not None:
                 return True
         self._preview = subprocess.Popen(
-            [ps.MPV_EXE, path, f"--start={start}", f"--input-ipc-server={self._preview_pipe}",
+            [ps.MPV_EXE, path, f"--start={start}", f"--input-ipc-server={self._preview_ipc}",
              "--force-window=yes", "--keep-open=yes", "--osd-level=3",
              "--osd-status-msg=${time-pos/full} / ${duration/full}",
              "--geometry=60%", "--title=GDPNow preview - ${filename}"],
@@ -367,7 +370,9 @@ class Api:
 
         def talk():
             try:
-                with open(self._preview_pipe, "r+b", buffering=0) as f:
+                conn = (open(self._preview_pipe, "r+b", buffering=0) if ps.IS_WIN
+                        else ps.UnixIpc(self._preview_pipe, timeout=timeout))
+                with contextlib.closing(conn) as f:
                     f.write((json.dumps(obj) + "\n").encode())
                     buf = b""
                     while True:
@@ -571,17 +576,60 @@ def _unblock_downloaded_dlls():
                     pass  # not marked, or a read-only folder
 
 
+def _mac_check_location():
+    """A downloaded app is quarantined: until it is moved out of Downloads,
+    macOS runs it from a temporary read-only copy (App Translocation), and it
+    would also stop the bundled mpv and ffmpeg. Ask to move it first; once
+    moved (and opened), clear the mark from the whole app."""
+    if not ps.PORTABLE:
+        return True
+    if "/AppTranslocation/" in ps.ROOT:
+        subprocess.run(["osascript", "-e",
+                        'display dialog "Move GDPNow to your Applications folder first (drag it there in '
+                        'Finder), then open it from there." buttons {"OK"} default button 1 with title "GDPNow"'],
+                       capture_output=True)
+        return False
+    bundle = os.path.dirname(os.path.dirname(ps.ROOT))  # .../GDPNow.app
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", bundle], capture_output=True)
+    return True
+
+
+def _mac_appearance():
+    """macOS: dark title bar, and GDPNow's name and icon in the menu bar and
+    Dock (the running process is the bundled python3, not the app bundle's
+    own launcher, so they would otherwise say Python)."""
+    try:
+        from AppKit import NSApplication, NSAppearance, NSImage
+        from Foundation import NSBundle
+        info = NSBundle.mainBundle().infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = APP_TITLE
+        app = NSApplication.sharedApplication()
+        app.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua"))
+        logo = os.path.join(ps.APP_DIR, "ui", "logo.png")
+        if os.path.exists(logo):
+            app.setApplicationIconImage_(NSImage.alloc().initWithContentsOfFile_(logo))
+    except Exception as e:
+        print(f"(macOS window style not applied: {e})")
+
+
 def main():
     global _window
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GDPNow.App")
-    except Exception:
-        pass
-    if not _ensure_webview2():
+    if ps.IS_WIN:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GDPNow.App")
+        except Exception:
+            pass
+        if not _ensure_webview2():
+            return
+    elif not _mac_check_location():
         return
     if os.environ.get("GDPNOW_TEST_CRASH") == "app":
         raise RuntimeError("test crash requested with GDPNOW_TEST_CRASH=app")
-    _unblock_downloaded_dlls()
+    if ps.IS_WIN:
+        _unblock_downloaded_dlls()
+    else:
+        _mac_appearance()
     import webview
     webview.settings["SHOW_DEFAULT_MENUS"] = False  # no browser right-click menu
     if os.environ.get("GDPNOW_DEBUG_PORT"):
@@ -591,10 +639,12 @@ def main():
                                     min_size=(1000, 700), background_color="#0B0C10",
                                     text_select=False)
     _window.events.closing += api._on_closing
-    _window.events.before_show += _style_before_show
-    _window.events.shown += lambda: threading.Thread(target=_style_native_window, daemon=True).start()
-    # never let pywebview silently fall back to Internet Explorer (MSHTML)
-    webview.start(gui="edgechromium", debug="--debug" in sys.argv)
+    if ps.IS_WIN:
+        _window.events.before_show += _style_before_show
+        _window.events.shown += lambda: threading.Thread(target=_style_native_window, daemon=True).start()
+    # Windows: never let pywebview silently fall back to Internet Explorer
+    # (MSHTML); macOS: the system's WebKit
+    webview.start(gui="edgechromium" if ps.IS_WIN else "cocoa", debug="--debug" in sys.argv)
 
 
 if __name__ == "__main__":
@@ -605,6 +655,9 @@ if __name__ == "__main__":
         try:
             ps.report_error_native("app window", details)
         except Exception:  # last resort: the report itself failed
-            ctypes.windll.user32.MessageBoxW(
-                0, f"GDPNow could not start. {ps.SUPPORT_LINE} and send this:\n\n{details[-1500:]}",
-                APP_TITLE, 0x10)
+            if ps.IS_WIN:
+                ctypes.windll.user32.MessageBoxW(
+                    0, f"GDPNow could not start. {ps.SUPPORT_LINE} and send this:\n\n{details[-1500:]}",
+                    APP_TITLE, 0x10)
+            else:
+                print(details)

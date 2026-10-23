@@ -1,6 +1,10 @@
 /* GDPNow app window: shared helpers + the Play view. */
 'use strict';
 
+// macOS (WebKit window): Cmd shortcuts and the Terminal runner for the video
+const IS_MAC = /Mac/.test(navigator.platform || navigator.userAgent);
+const GRWM_RUNNER = IS_MAC ? 'run_grwm.command' : 'run_grwm.bat';
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const el = (tag, attrs = {}, ...kids) => {
@@ -45,7 +49,7 @@ function showErrorReport(rep) {
   const where = (rep.full.split('\n').find((l) => l.startsWith('Where: ')) || '').slice(7);
   $('#err-where').textContent = where ? `In the ${where}.` : '';
   $('#err-support').textContent = rep.support || 'DM the pope on Discord';
-  $('#err-how').textContent = 'Copy the text below (it is already selected: press Ctrl+C) and paste it into the chat.';
+  $('#err-how').textContent = `Copy the text below (it is already selected: press ${IS_MAC ? 'Cmd' : 'Ctrl'}+C) and paste it into the chat.`;
   const box = $('#err-text');
   box.value = rep.short;
   const name = (rep.path || '').split(/[\\/]/).pop();
@@ -481,6 +485,8 @@ async function init() {
   $('#btn-pick-empty').onclick = pickFolder;
   $('#btn-rescan').onclick = () => rescan(true);
   $('#btn-start').onclick = startSession;
+  $$('.grwm-runner').forEach((n) => { n.textContent = GRWM_RUNNER; });
+  if (IS_MAC) $$('.mac-only').forEach((n) => n.classList.remove('hidden'));
   const pickInput = $('#pick-input');
   pickInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addPick(pickInput.value); } });
   // clicking a suggestion adds it right away (typing waits for Enter)
@@ -493,7 +499,7 @@ async function init() {
   $('#btn-open-session').onclick = () => call('open_path', S.sessionDir);
   $('#btn-make-video').onclick = async () => {
     if (await call('make_video', S.sessionDir)) toast('Building grwm.mp4 in a new window. It closes when done.', 'ok');
-    else toast('run_grwm.bat was not found in the session folder.', 'err');
+    else toast(`${GRWM_RUNNER} was not found in the session folder.`, 'err');
   };
   $('#btn-new').onclick = () => { $('#card-done').classList.add('hidden'); $('#card-start').classList.remove('hidden'); render(); };
   window.addEventListener('resize', () => render());
