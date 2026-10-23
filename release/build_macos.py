@@ -138,6 +138,10 @@ def build():
     tmp = os.path.join(BUILD, "_mpv")
     shutil.rmtree(tmp, ignore_errors=True)
     run(["ditto", "-x", "-k", fetch(*dl["mpv"]), tmp])
+    # the zip holds mpv.tar.gz (keeps mpv.app's symlinks and permissions)
+    for name in os.listdir(tmp):
+        if name.endswith((".tar.gz", ".tgz")):
+            run(["tar", "-xzf", os.path.join(tmp, name), "-C", tmp])
     found = [os.path.join(r, d) for r, ds, _ in os.walk(tmp) for d in ds if d == "mpv.app"]
     if not found:
         raise SystemExit("mpv.app not found in the mpv download")
