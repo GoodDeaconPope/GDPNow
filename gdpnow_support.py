@@ -668,22 +668,12 @@ def report_error_native(where, details, log_text=""):
 
 
 def _error_fallback(where, short, path):
-    """Only if the dialog could not be shown at all: put the report in a text
-    file, open it in Notepad (copyable), and say so in a plain box."""
+    """Last resort, only if the dialog could not be created at all: a plain
+    Windows box with the same report (Ctrl+C copies a box's whole text)."""
     import ctypes
-    note = None
-    try:
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-        note = os.path.join(REPORTS_DIR, "copy this into Discord.txt")
-        with open(note, "w", encoding="utf-8") as f:
-            f.write(short + "\n")
-        subprocess.Popen(["notepad.exe", note])
-    except Exception:
-        note = None
     ctypes.windll.user32.MessageBoxW(
-        0, f"Something went wrong ({where}).\n\n{SUPPORT_LINE}.\n\n"
-           + ("The report is open in Notepad: copy it from there (Ctrl+A, Ctrl+C) and paste it into the chat."
-              if note else short),
+        0, f"Something went wrong ({where}).\n\n{SUPPORT_LINE}. Press Ctrl+C to copy this "
+           f"message and paste it into the chat.\n\n{short}",
         "GDPNow - error", 0x10 | 0x10000)
 
 
