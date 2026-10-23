@@ -91,7 +91,7 @@ check("GPU decoder measurement runs", r.returncode == 0, r.stdout.strip() or r.s
 vids = os.path.join(out, "videos")
 os.makedirs(vids, exist_ok=True)
 system_map = {}
-for n in (101, 102, 103, 104):
+for n in range(101, 109):  # 2x2 grid x 2 episodes per cell
     path = os.path.join(vids, f"Episode {n} test.mp4")
     if not os.path.exists(path):
         sh([FF, "-v", "error", "-f", "lavfi", "-i", f"testsrc2=s=1280x720:r=30:d=40",
@@ -102,7 +102,7 @@ map_file = os.path.join(vids, "systemFileMap.json")
 json.dump(system_map, open(map_file, "w"), indent=1)
 os.makedirs(STATE, exist_ok=True)
 json.dump({"video_dir": vids, "map_file": map_file}, open(os.path.join(STATE, "settings.json"), "w"))
-check("test videos made", len(glob.glob(os.path.join(vids, "*.mp4"))) == 4)
+check("test videos made", len(glob.glob(os.path.join(vids, "*.mp4"))) == 8)
 
 # 5. a 2x2 session from the player
 stop_file = os.path.join(out, "stop")
@@ -128,6 +128,15 @@ geoms = [ipc(s, ["get_property", "geometry"]) for s in socks]
 check("cell geometry set", all(geoms), geoms)
 time.sleep(2)
 screenshot("grid.png")
+# the cells must show the test pattern on screen, not one flat colour
+r = sh([PY, "-c", "import sys\nfrom PIL import Image, ImageStat\n"
+        "im = Image.open(sys.argv[1]).convert('RGB'); w, h = im.size\n"
+        "top, bottom = int(h * 0.05), int(h * 0.85)\n"  # skip the menu bar and the Dock
+        "boxes = [(0, top, w // 2, h // 2), (w // 2, top, w, h // 2), (0, h // 2, w // 2, bottom), (w // 2, h // 2, w, bottom)]\n"
+        "print([round(sum(ImageStat.Stat(im.crop(b)).stddev) / 3, 1) for b in boxes])",
+        os.path.join(out, "grid.png")])
+spread = json.loads(r.stdout.strip() or "[]")
+check("cells show video on screen", len(spread) == 4 and min(spread) > 15, f"colour spread per cell {spread} {r.stderr[-200:]}")
 time.sleep(7)
 names_after = [ipc(s, ["get_property", "filename"]) for s in socks]
 check("rotation switched episodes", names_before != names_after, f"{names_before} -> {names_after}")
@@ -182,8 +191,12 @@ qapp = os.path.join(qdir, "GDPNow.app")
 sh(["ditto", bundle, qapp])
 sh(["xattr", "-rw", "com.apple.quarantine", f"0081;{int(time.time()):x};Safari;", qapp])
 qres = os.path.join(qapp, "Contents", "Resources")
-r = sh([os.path.join(qres, "runtime", "python", "bin", "python3"), "-c",
-        f"import sys; sys.path.insert(0, {os.path.join(qres, 'app')!r}); import gdpnow_app; print(gdpnow_app._mac_check_location())"])
+try:
+    r = sh([os.path.join(qres, "runtime", "python", "bin", "python3"), "-c",
+            f"import sys; sys.path.insert(0, {os.path.join(qres, 'app')!r}); import gdpnow_app; "
+            "print(gdpnow_app._mac_check_location())"], timeout=60)
+except subprocess.TimeoutExpired:
+    r = subprocess.CompletedProcess([], 1, "", "timed out (blocked by Gatekeeper?)")
 left = sh(["xattr", "-p", "com.apple.quarantine", os.path.join(qres, "runtime", "mpv", "mpv.app", "Contents", "MacOS", "mpv")])
 check("app clears the download mark from its tools", r.stdout.strip().endswith("True") and left.returncode != 0,
       (r.stdout + r.stderr).strip()[-300:])

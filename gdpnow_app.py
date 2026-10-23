@@ -354,7 +354,8 @@ class Api:
             [ps.MPV_EXE, path, f"--start={start}", f"--input-ipc-server={self._preview_ipc}",
              "--force-window=yes", "--keep-open=yes", "--osd-level=3",
              "--osd-status-msg=${time-pos/full} / ${duration/full}",
-             "--geometry=60%", "--title=GDPNow preview - ${filename}"],
+             "--geometry=60%", "--title=GDPNow preview - ${filename}"]
+            + ([] if ps.IS_WIN else ["--vo=libmpv"]),  # macOS: OpenGL output, as in the grid
             creationflags=NO_WINDOW)
         return True
 

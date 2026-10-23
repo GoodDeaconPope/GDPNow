@@ -1241,13 +1241,16 @@ def _mac_mpv_params(socket_index, config):
     (mpv puts a window at x% of the free width, so column c of n is at
     c/(n-1)); no Retina point/pixel question. Keys pressed in a cell reach
     the player through mac_keys.lua (no Accessibility permission needed), and
-    the cells get no Dock icons. These come last, so they win."""
+    the cells get no Dock icons. Video goes through mpv's OpenGL output
+    (cocoa-cb, "--vo=libmpv" on macOS): its Vulkan output (MoltenVK) crashed
+    on an Intel Mac and drew solid blue on an Apple Silicon one in the build
+    tests. These come last, so they win."""
     cols, rows = max(1, config.column_grid), max(1, config.row_grid)
     col, row = socket_index % cols, socket_index // cols
     w, h = math.ceil(100 / cols), math.ceil(100 / rows)
     x = 0 if cols == 1 else round(100 * col / (cols - 1))
     y = 0 if rows == 1 else round(100 * row / (rows - 1))
-    params = [f"--geometry={w}%x{h}%+{x}%+{y}%", f"--screen={_selected_screen_index}",
+    params = ["--vo=libmpv", f"--geometry={w}%x{h}%+{x}%+{y}%", f"--screen={_selected_screen_index}",
               f"--fs-screen={_selected_screen_index}", "--native-fs=no", "--no-border",
               "--macos-app-activation-policy=accessory", "--input-vo-keyboard=yes",
               f"--script={os.path.join(_ps.APP_DIR, 'mac_keys.lua')}"]
