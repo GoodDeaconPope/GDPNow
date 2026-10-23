@@ -155,20 +155,7 @@ def _pick_folder_dialog(title):
     """Windows folder picker (the modern Explorer-style one). Returns a
     path or None if cancelled / unavailable."""
     try:
-        import pythoncom
-        from win32com.shell import shell, shellcon
-        pythoncom.CoInitialize()
-        dlg = pythoncom.CoCreateInstance(shell.CLSID_FileOpenDialog, None,
-                                         pythoncom.CLSCTX_INPROC_SERVER,
-                                         shell.IID_IFileOpenDialog)
-        dlg.SetOptions(dlg.GetOptions() | shellcon.FOS_PICKFOLDERS
-                       | shellcon.FOS_FORCEFILESYSTEM | shellcon.FOS_PATHMUSTEXIST)
-        dlg.SetTitle(title)
-        try:
-            dlg.Show(0)
-        except pythoncom.com_error:
-            return None  # cancelled
-        return dlg.GetResult().GetDisplayName(shellcon.SIGDN_FILESYSPATH)
+        return _modern_folder_dialog(title)
     except Exception as e:
         print(f"(Folder window unavailable: {e})")
     try:
@@ -177,6 +164,74 @@ def _pick_folder_dialog(title):
         return shell.SHGetPathFromIDList(pidl).decode("mbcs") if pidl else None
     except Exception:
         return None
+
+
+def _modern_folder_dialog(title, start=None):
+    """Windows' Explorer-style folder picker (IFileOpenDialog with
+    FOS_PICKFOLDERS) through raw COM vtable calls: pywin32 does not wrap
+    this interface. Returns the folder path, or None if cancelled."""
+    import ctypes
+    from ctypes import POINTER, byref, c_void_p, wintypes
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitialize(None)
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD),
+                    ("d", ctypes.c_ubyte * 8)]
+
+    def guid(text):
+        g = GUID()
+        ole32.CLSIDFromString(ctypes.c_wchar_p(text), byref(g))
+        return g
+
+    def call(obj, index, restype, *args_types_values):
+        types = [t for t, _ in args_types_values]
+        vtable = ctypes.cast(obj, POINTER(POINTER(c_void_p))).contents
+        fn = ctypes.WINFUNCTYPE(restype, c_void_p, *types)(vtable[index])
+        return fn(obj, *[v for _, v in args_types_values])
+
+    S_OK, CANCELLED = 0, ctypes.c_long(0x800704C7).value
+    FOS_PICKFOLDERS, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST = 0x20, 0x40, 0x800
+    SIGDN_FILESYSPATH = ctypes.c_long(0x80058000).value
+    dlg = c_void_p()
+    hr = ole32.CoCreateInstance(byref(guid("{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}")), None, 1,  # FileOpenDialog
+                                byref(guid("{42f85136-db7e-439c-85f1-e4075d135fc8}")), byref(dlg))  # IFileDialog
+    if hr != S_OK:
+        raise OSError(f"CoCreateInstance failed 0x{hr & 0xFFFFFFFF:08X}")
+    try:
+        opts = wintypes.DWORD()
+        call(dlg, 10, ctypes.c_long, (POINTER(wintypes.DWORD), byref(opts)))           # GetOptions
+        call(dlg, 9, ctypes.c_long, (wintypes.DWORD,                                     # SetOptions
+                                     opts.value | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST))
+        call(dlg, 17, ctypes.c_long, (wintypes.LPCWSTR, title))                          # SetTitle
+        if start and os.path.isdir(start):
+            item = c_void_p()
+            if ctypes.windll.shell32.SHCreateItemFromParsingName(
+                    ctypes.c_wchar_p(start), None,
+                    byref(guid("{43826d1e-e718-42ee-bc55-a1e261c37bfe}")), byref(item)) == S_OK:  # IShellItem
+                call(dlg, 12, ctypes.c_long, (c_void_p, item))                           # SetFolder
+                call(item, 2, ctypes.c_ulong)                                            # Release
+        hr = call(dlg, 3, ctypes.c_long, (wintypes.HWND, None))                          # Show
+        if hr == CANCELLED:
+            return None
+        if hr != S_OK:
+            raise OSError(f"Show failed 0x{hr & 0xFFFFFFFF:08X}")
+        item = c_void_p()
+        if call(dlg, 20, ctypes.c_long, (POINTER(c_void_p), byref(item))) != S_OK:      # GetResult
+            return None
+        name = ctypes.c_wchar_p()
+        try:
+            if call(item, 5, ctypes.c_long, (ctypes.c_long, SIGDN_FILESYSPATH),          # GetDisplayName
+                    (POINTER(ctypes.c_wchar_p), byref(name))) != S_OK:
+                return None
+            return name.value
+        finally:
+            if name:
+                ole32.CoTaskMemFree(name)
+            call(item, 2, ctypes.c_ulong)
+    finally:
+        call(dlg, 2, ctypes.c_ulong)                                                     # Release
 
 
 def choose_video_dir():
@@ -607,13 +662,29 @@ def report_error_native(where, details, log_text=""):
              "Copy the text below (it is already selected: press Ctrl+C) and paste it into the chat."
              + (f"\r\nThe full report is also saved in the \"error reports\" folder as {os.path.basename(path)}."
                 if path else ""))
-    try:
-        _error_dialog(intro, short)
-    except Exception:  # plain box as a fallback (Ctrl+C copies a message box's text)
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(0, f"{SUPPORT_LINE}.\n\n{intro}\n\n{short}", "GDPNow - error",
-                                         0x10 | 0x10000)
+    if not _error_dialog(intro, short):
+        _error_fallback(where, short, path)
     return path
+
+
+def _error_fallback(where, short, path):
+    """Only if the dialog could not be shown at all: put the report in a text
+    file, open it in Notepad (copyable), and say so in a plain box."""
+    import ctypes
+    note = None
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        note = os.path.join(REPORTS_DIR, "copy this into Discord.txt")
+        with open(note, "w", encoding="utf-8") as f:
+            f.write(short + "\n")
+        subprocess.Popen(["notepad.exe", note])
+    except Exception:
+        note = None
+    ctypes.windll.user32.MessageBoxW(
+        0, f"Something went wrong ({where}).\n\n{SUPPORT_LINE}.\n\n"
+           + ("The report is open in Notepad: copy it from there (Ctrl+A, Ctrl+C) and paste it into the chat."
+              if note else short),
+        "GDPNow - error", 0x10 | 0x10000)
 
 
 def _error_dialog(intro, report):
@@ -627,6 +698,7 @@ def _error_dialog(intro, report):
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor v2
     except Exception:
         pass
+    shown = []  # filled when the dialog appears: then no fallback may follow
     actctx = _activate_comctl6()
     try:
         ID_ICON, ID_TITLE, ID_INTRO, ID_EDIT = 101, 102, 103, 104
@@ -649,6 +721,7 @@ def _error_dialog(intro, report):
 
         def proc(hwnd, msg, wparam, lparam):
             if msg == win32con.WM_INITDIALOG:
+                shown.append(True)
                 win32gui.SendMessage(win32gui.GetDlgItem(hwnd, ID_ICON), win32con.STM_SETICON,
                                      win32gui.LoadIcon(0, win32con.IDI_ERROR), 0)
                 bold = win32gui.LOGFONT()
@@ -680,9 +753,11 @@ def _error_dialog(intro, report):
         win32gui.DialogBoxIndirect(0, template, 0, proc)
         for f in fonts:
             win32gui.DeleteObject(f)
+    except Exception:
+        pass  # if it never appeared, the caller falls back; if it did, we're done
     finally:
-        if actctx:
-            ctypes.windll.kernel32.DeactivateActCtx(0, actctx)
+        _deactivate_comctl6(actctx)
+    return bool(shown)
 
 
 def _px(hwnd, size_at_96dpi):
@@ -695,7 +770,7 @@ def _px(hwnd, size_at_96dpi):
 
 def _activate_comctl6():
     """Modern-looking controls for the dialog (see ui/comctl6.manifest).
-    Returns the activation cookie, or None (the dialog then just looks older)."""
+    Returns (context handle, cookie), or None (the dialog then just looks older)."""
     import ctypes
     from ctypes import wintypes
     manifest = os.path.join(APP_DIR, "ui", "comctl6.manifest")
@@ -722,7 +797,25 @@ def _activate_comctl6():
         ctypes.windll.comctl32.InitCommonControls()
     except Exception:
         pass
-    return cookie.value
+    return handle, cookie.value
+
+
+def _deactivate_comctl6(actctx):
+    """Undo _activate_comctl6. The cookie is a pointer-sized value: ctypes
+    needs explicit argument types or it overflows (that once broke the dialog)."""
+    if not actctx:
+        return
+    import ctypes
+    from ctypes import wintypes
+    handle, cookie = actctx
+    k32 = ctypes.windll.kernel32
+    try:
+        k32.DeactivateActCtx.argtypes = [wintypes.DWORD, ctypes.c_size_t]
+        k32.DeactivateActCtx(0, cookie)
+        k32.ReleaseActCtx.argtypes = [wintypes.HANDLE]
+        k32.ReleaseActCtx(handle)
+    except Exception:
+        pass
 
 
 def run_player(main):
