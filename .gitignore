@@ -1,22 +1,12 @@
-# Whitelist: track code and the map, never the videos or build output.
-*
-!.gitignore
-!systemFileMap.json
-!*.py
-!ui/
-!ui/**
-!release/
-!release/**
-!rust/
-!rust/**
-# Rust: bundled libmpv binaries + downloads are fetched/rebuilt (see rust/docs/BUILD_LIBMPV.md)
-rust/vendor/dl/
-rust/vendor/libmpv/*.dll
-rust/vendor/libmpv/*.lib
-rust/vendor/libmpv/*.exp
-rust/vendor/libmpv/*.dll.a
-rust/vendor/libmpv/exports.txt
-rust/vendor/libmpv/lib_gen.log
-rust/**/target/
+# build output (release zip, downloads cache)
+build/
 __pycache__/
 *.pyc
+
+# the Rust port lives in rust/ as its own git repo, not part of this one
+rust/
+
+# local state if the app is run from here
+settings.json
+video_matches.txt
+error reports/
