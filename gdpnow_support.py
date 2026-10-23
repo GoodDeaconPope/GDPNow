@@ -1,8 +1,8 @@
 """Support code for gdpnow.py and the GDPNow app window.
 
 Works in two places:
-  - the repo (E:\\1SystemFile): mpv / ffmpeg / Python from PATH, the map next
-    to gdpnow.py, the videos in that same folder unless another is chosen;
+  - the repo: mpv / ffmpeg / Python from PATH; the video folder and the map
+    to use come from settings (the map next to gdpnow.py is the release map);
   - the release zip (GDPNow\\app\\ next to GDPNow\\runtime\\): bundled mpv,
     ffmpeg and Python, settings and reports next to the launcher.
 It holds: tool paths, the video folder setting, matching any file name to
@@ -265,8 +265,6 @@ def load_map(path=None):
 
 def get_video_dir():
     path = load_settings().get("video_dir")
-    if not path and not PORTABLE and not _choose_requested:
-        path = APP_DIR  # from the repo: the videos live next to gdpnow.py
     if _answers is not None and (not path or not os.path.isdir(path)):
         raise SystemExit(f"Video folder not found: {path!r}. Pick it in the GDPNow window.")
     if _choose_requested or not path or not os.path.isdir(path):

@@ -5,11 +5,11 @@ gdpnow_app.py (the app window), ui\\ and systemFileMap.json, next to a
 bundled runtime: embeddable Python 3.12 with its libraries, mpv, ffmpeg and
 Microsoft's WebView2 installer.
 
-    python release\\build_release.py            -> C:\\gdpnow-build\\dist\\GDPNow\\ + GDPNow.zip
+    python release\\build_release.py            -> build\\dist\\GDPNow\\ + GDPNow.zip
     python release\\build_release.py --no-zip
     python release\\build_release.py --out NAME (build into dist\\NAME, e.g. while GDPNow is open)
 
-Downloads it needs (cached in C:\\gdpnow-build\\downloads):
+Downloads it needs (cached in build\\downloads):
   pyembed.zip   python.org python-3.12.10-embed-amd64.zip
   wheels\\       pywin32 pynput pillow screeninfo pywebview (+ deps; proxy_tools and
                 bottle are sdist-only upstream: build them with `pip wheel --no-deps`)
@@ -30,7 +30,10 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-BUILD = os.environ.get("GDPNOW_BUILD_DIR", r"C:\gdpnow-build")
+BUILD = os.environ.get("GDPNOW_BUILD_DIR", os.path.join(REPO, "build"))
+# The map you edit day to day (the "working map") can live outside the repo;
+# each build copies it over the repo's release map so the zip ships the latest.
+WORKING_MAP = os.environ.get("GDPNOW_WORKING_MAP", r"E:\1SystemFile\systemFileMap.json")
 DL = os.path.join(BUILD, "downloads")
 DIST = os.path.join(BUILD, "dist")
 OUT = os.path.join(DIST, sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else "GDPNow")
@@ -77,6 +80,13 @@ def build():
     ff = os.path.join(OUT, "runtime", "ffmpeg")
     for d in (app, py, mpv, ff):
         os.makedirs(d)
+
+    release_map = os.path.join(REPO, "systemFileMap.json")
+    if os.path.isfile(WORKING_MAP) and open(WORKING_MAP, "rb").read() != open(release_map, "rb").read():
+        import json
+        json.load(open(WORKING_MAP, encoding="utf-8-sig"))  # refuse a broken working map
+        shutil.copy2(WORKING_MAP, release_map)
+        print(f"release map refreshed from the working map {WORKING_MAP} (commit it)")
 
     print("app: gdpnow.py, support module, app window, ui, map")
     for name in APP_FILES:
