@@ -64,10 +64,11 @@ Scene types used for sessions: `PC`, `RC`, `PM`, `D`, `M`, `CSP`, `BJ`.
 
 ## Running from source
 
+Only needed to work on the code; the release zip already contains everything.
 Python 3.12 on Windows with `mpv` and `ffmpeg` on `PATH`:
 
 ```
-pip install pywin32 pynput pillow screeninfo pywebview
+pip install -r requirements.txt
 python gdpnow.py          # the original text version (typed questions)
 python gdpnow_app.py      # the app window
 ```

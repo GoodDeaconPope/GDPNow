@@ -1,0 +1,7 @@
+# Python 3.12 on Windows. These are the exact versions bundled in the release zip
+# (release/build_release.py installs from this file). Also needs mpv and ffmpeg on PATH.
+pywin32==312
+pynput==1.8.2
+pillow==13.0.0
+screeninfo==0.8.1
+pywebview==6.2.1

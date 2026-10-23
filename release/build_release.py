@@ -12,8 +12,8 @@ Microsoft's WebView2 installer.
 
 Downloads it needs (cached in build\\downloads):
   pyembed.zip   python.org python-3.12.10-embed-amd64.zip
-  wheels\\       pywin32 pynput pillow screeninfo pywebview (+ deps; proxy_tools and
-                bottle are sdist-only upstream: build them with `pip wheel --no-deps`)
+  wheels\\       requirements.txt (+ deps; proxy_tools and bottle are sdist-only
+                upstream: build them with `pip wheel --no-deps`)
   mpv.7z        zhongfly/mpv-winbuild mpv-x86_64-<date>.7z (non-v3: runs on any x64 CPU)
   MicrosoftEdgeWebview2Setup.exe   https://go.microsoft.com/fwlink/p/?LinkId=2124703
 ffmpeg.exe comes from PATH (or GDPNOW_FFMPEG): a static GPL build with NVENC, libx264,
@@ -136,7 +136,7 @@ def build():
     run([sys.executable, "-m", "pip", "install", "--quiet", "--no-index",
          "--find-links", os.path.join(DL, "wheels"), "--target",
          os.path.join(py, "Lib", "site-packages"), "--no-compile",
-         "pywin32", "pynput", "pillow", "screeninfo", "pywebview"])
+         "-r", os.path.join(REPO, "requirements.txt")])
 
     print("runtime: mpv")
     tmp = os.path.join(BUILD, "_mpv_extract")
