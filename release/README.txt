@@ -8,9 +8,10 @@ Everything it needs is inside this folder. Nothing gets installed.
 START
   1. Unzip the whole folder somewhere, for example your Desktop or Documents.
      (Running it from inside the zip does not work.)
-  2. Double-click "Start GDPNow.bat".
+  2. Double-click GDPNow.exe.
      If Windows says "Windows protected your PC", click "More info" and then
-     "Run anyway". That warning shows for any program downloaded from the internet.
+     "Run anyway". That warning shows for programs downloaded from the internet
+     that are not signed with a paid certificate.
   3. Click "Choose video folder" and pick the folder with your videos.
      Subfolders are included.
 
@@ -57,3 +58,5 @@ SPEED
 OTHER
   extras\Console mode (typed questions).bat runs the original text version.
   Settings are saved in settings.json in this folder.
+  If something goes wrong, GDPNow shows an error report: DM the pope on Discord
+  and paste it.

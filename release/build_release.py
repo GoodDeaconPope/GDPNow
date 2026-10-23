@@ -5,7 +5,8 @@ gdpnow_app.py (the app window), ui\\ and systemFileMap.json, next to a
 bundled runtime: embeddable Python 3.12 with its libraries, mpv, ffmpeg and
 Microsoft's WebView2 installer.
 
-    python release\\build_release.py            -> build\\dist\\GDPNow\\ + GDPNow.zip
+    python release\\build_release.py [--version 1.0.0]
+                                               -> build\\dist\\GDPNow\\ + GDPNow-<version>-windows-x64.zip
     python release\\build_release.py --no-zip
     python release\\build_release.py --out NAME (build into dist\\NAME, e.g. while GDPNow is open)
 
@@ -37,7 +38,9 @@ WORKING_MAP = os.environ.get("GDPNOW_WORKING_MAP", r"E:\1SystemFile\systemFileMa
 DL = os.path.join(BUILD, "downloads")
 DIST = os.path.join(BUILD, "dist")
 OUT = os.path.join(DIST, sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else "GDPNow")
+VERSION = sys.argv[sys.argv.index("--version") + 1] if "--version" in sys.argv else "1.0.0"
 SEVENZIP = r"C:\Program Files\7-Zip\7z.exe"
+CSC = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), r"Microsoft.NET\Framework64\v4.0.30319\csc.exe")
 FFMPEG_SRC = os.environ.get("GDPNOW_FFMPEG") or shutil.which("ffmpeg.exe")
 APP_FILES = ("gdpnow.py", "gdpnow_support.py", "gdpnow_app.py", "systemFileMap.json")
 TEXT_EXT = (".py", ".json", ".txt", ".bat", ".html", ".css", ".js", ".manifest")
@@ -67,6 +70,24 @@ def privacy_check(root):
                     found.append(f"{os.path.relpath(p, root)}: {n!r}")
     if found:
         raise SystemExit("PRIVACY CHECK FAILED (personal names/paths in shipped files):\n  " + "\n  ".join(found))
+
+
+def build_launcher(exe_path):
+    """GDPNow.exe (launcher\\GDPNow.cs): starts the app with no console window and
+    carries the app icon + version. Compiled with the C# compiler in Windows."""
+    if not os.path.isfile(CSC):
+        raise SystemExit(f"C# compiler not found: {CSC}")
+    info = os.path.join(BUILD, "_AssemblyInfo.cs")
+    v4 = ".".join((VERSION.split("-")[0].split(".") + ["0", "0", "0"])[:4])
+    with open(info, "w", encoding="utf-8") as f:
+        f.write("using System.Reflection;\n"
+                '[assembly: AssemblyTitle("GDPNow")]\n[assembly: AssemblyProduct("GDPNow")]\n'
+                f'[assembly: AssemblyVersion("{v4}")]\n[assembly: AssemblyFileVersion("{v4}")]\n'
+                f'[assembly: AssemblyInformationalVersion("{VERSION}")]\n')
+    run([CSC, "/nologo", "/target:winexe", "/optimize+", f"/out:{exe_path}",
+         f"/win32icon:{os.path.join(REPO, 'ui', 'gdpnow.ico')}", "/r:System.Windows.Forms.dll",
+         os.path.join(HERE, "launcher", "GDPNow.cs"), info])
+    os.remove(info)
 
 
 def build():
@@ -103,7 +124,7 @@ def build():
     except OSError:
         commit, dirty = "?", ""
     with open(os.path.join(app, "VERSION.txt"), "w", encoding="utf-8") as f:
-        f.write(f"build {datetime.datetime.now():%Y-%m-%d %H:%M}, commit {commit}{'+changes' if dirty else ''}, "
+        f.write(f"GDPNow {VERSION}, build {datetime.datetime.now():%Y-%m-%d %H:%M}, commit {commit}{'+changes' if dirty else ''}, "
                 f"gdpnow.py {sha(os.path.join(REPO, 'gdpnow.py'))}, map {sha(os.path.join(REPO, 'systemFileMap.json'))}\n")
 
     print("runtime: embeddable Python 3.12 + libraries")
@@ -139,9 +160,7 @@ def build():
     shutil.copy2(os.path.join(DL, "MicrosoftEdgeWebview2Setup.exe"), os.path.join(OUT, "runtime", "webview2"))
 
     print("launchers + readme")
-    with open(os.path.join(OUT, "Start GDPNow.bat"), "w", encoding="ascii", newline="\r\n") as f:
-        f.write("@echo off\ncd /d \"%~dp0\"\nset PYTHONUTF8=1\n"
-                "start \"\" \"%~dp0runtime\\python\\pythonw.exe\" \"%~dp0app\\gdpnow_app.py\"\n")
+    build_launcher(os.path.join(OUT, "GDPNow.exe"))
     extras = os.path.join(OUT, "extras")
     os.makedirs(extras)
     with open(os.path.join(extras, "Console mode (typed questions).bat"), "w",
@@ -157,7 +176,7 @@ def build():
         print(f"done (no zip): {OUT}")
         return
     print("zip")
-    zpath = os.path.join(DIST, "GDPNow.zip")
+    zpath = os.path.join(DIST, f"GDPNow-{VERSION}-windows-x64.zip")
     if os.path.exists(zpath):
         os.remove(zpath)
     skip = {"settings.json", "video_matches.txt", "app_error.log"}
